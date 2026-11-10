@@ -13,7 +13,7 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
 MANGADEX_API = "https://api.mangadex.org"
 COVER_BASE_URL = "https://uploads.mangadex.org/covers"
 HEADERS = {
-    "User-Agent": "XteinkMangaOPDS/2.5 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
+    "User-Agent": "XteinkMangaOPDS/3.0 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
     "Accept": "application/json"
 }
 
@@ -240,41 +240,59 @@ def fetch_chapters(manga_id):
     data = res.json()
     return data.get('data', [])
 
+def crop_margins(im, threshold=242, margin_pad=4):
+    if im.mode != 'L':
+        im = ImageOps.grayscale(im)
+    w, h = im.size
+    inv = ImageOps.invert(im)
+    mask = inv.point(lambda p: 255 if p > (255 - threshold) else 0)
+    bbox = mask.getbbox()
+    if bbox:
+        left, upper, right, lower = bbox
+        left = max(0, left - margin_pad)
+        upper = max(0, upper - margin_pad)
+        right = min(w, right + margin_pad)
+        lower = min(h, lower + margin_pad)
+        if (right - left) > w * 0.65 and (lower - upper) > h * 0.65:
+            return im.crop((left, upper, right, lower))
+    return im
+
 def optimize_and_split_image(img_bytes):
     im = Image.open(io.BytesIO(img_bytes))
     if im.mode != 'L':
         im = ImageOps.grayscale(im)
     
+    im = crop_margins(im)
     w, h = im.size
     sub_images = []
     
     if w > h * 1.25:
         mid = w // 2
-        right_page = im.crop((mid, 0, w, h))
-        left_page = im.crop((0, 0, mid, h))
+        right_page = crop_margins(im.crop((mid, 0, w, h)))
+        left_page = crop_margins(im.crop((0, 0, mid, h)))
         sub_images.extend([right_page, left_page])
-    elif h > w * 1.8:
-        target_h = int(w * 1.6)
+    elif h > w * 1.5:
+        target_h = int(w * 1.55)
+        overlap = int(w * 0.12)
         curr_y = 0
         while curr_y < h:
             chunk_h = min(target_h, h - curr_y)
-            if chunk_h < target_h * 0.2 and sub_images:
-                break
             cropped = im.crop((0, curr_y, w, min(curr_y + chunk_h, h)))
-            sub_images.append(cropped)
-            curr_y += chunk_h
+            sub_images.append(crop_margins(cropped))
+            if curr_y + chunk_h >= h:
+                break
+            curr_y += (chunk_h - overlap)
     else:
         sub_images.append(im)
         
     final_buffers = []
     for sub in sub_images:
         sub.thumbnail((480, 800), Image.Resampling.LANCZOS)
-        enhancer = ImageEnhance.Contrast(sub)
-        sub = enhancer.enhance(1.3)
-        sub = sub.filter(ImageFilter.UnsharpMask(radius=1.2, percent=130, threshold=3))
+        sub = ImageOps.autocontrast(sub, cutoff=1)
+        sub = sub.filter(ImageFilter.UnsharpMask(radius=1.0, percent=125, threshold=2))
         
         buf = io.BytesIO()
-        sub.save(buf, format='JPEG', quality=80, optimize=True)
+        sub.save(buf, format='JPEG', quality=88, optimize=True, subsampling=0)
         final_buffers.append(buf.getvalue())
         
     return final_buffers
@@ -294,7 +312,7 @@ def generate_epub(chapter_id, chapter_title):
         raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên MangaDex.")
 
     processed_images = []
-    print(f"[*] Đang tải và phóng to thông minh {len(file_list)} trang ảnh cho: {chapter_title}...")
+    print(f"[*] Đang tải và phóng to tối đa {len(file_list)} trang ảnh cho: {chapter_title}...")
     for idx, fname in enumerate(file_list):
         img_url = f"{base_url}/{sub_folder}/{ch_hash}/{fname}"
         try:
@@ -558,7 +576,7 @@ def run():
     port = int(os.environ.get('PORT', 7860))
     server_address = ('0.0.0.0', port)
     httpd = http.server.ThreadingHTTPServer(server_address, MangaOPDSHandler)
-    print(f"[*] Xteink MangaDex 2.5 Server running on port {port}...")
+    print(f"[*] Xteink MangaDex 3.0 Ultra-Crisp running on port {port}...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
