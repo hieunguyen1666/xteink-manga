@@ -9,7 +9,6 @@ import sys
 import traceback
 from PIL import Image, ImageOps
 
-# Thử dùng curl_cffi để bypass Cloudflare, fallback sang requests
 try:
     from curl_cffi import requests
     USE_CURL = True
@@ -19,7 +18,7 @@ except ImportError:
     USE_CURL = False
     print("[!] Fallback to standard requests")
 
-BASE_TRUYENQQ = 'https://truyenqqko.com'
+BASE_TRUYENQQ = 'https://truyenqq.com.vn'
 
 def create_session():
     if USE_CURL:
@@ -27,7 +26,7 @@ def create_session():
     s = requests.Session()
     s.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': 'https://truyenqqko.com/'
+        'Referer': 'https://truyenqq.com.vn/'
     })
     return s
 
@@ -36,7 +35,10 @@ session = create_session()
 def fetch_html(url):
     if not url.startswith('http'):
         url = urllib.parse.urljoin(BASE_TRUYENQQ, url)
-    headers = {'Referer': BASE_TRUYENQQ + '/'}
+    headers = {
+        'Referer': BASE_TRUYENQQ + '/',
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    }
     resp = session.get(url, headers=headers, timeout=20)
     resp.encoding = 'utf-8'
     return resp.text
@@ -44,7 +46,10 @@ def fetch_html(url):
 def fetch_bytes(url):
     if not url.startswith('http'):
         url = urllib.parse.urljoin(BASE_TRUYENQQ, url)
-    headers = {'Referer': BASE_TRUYENQQ + '/'}
+    headers = {
+        'Referer': BASE_TRUYENQQ + '/',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    }
     resp = session.get(url, headers=headers, timeout=20)
     return resp.content
 
@@ -62,7 +67,7 @@ def build_root_feed(base_url):
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
 
   <entry>
-    <title>🔥 TruyenQQ - Truyện Phổ Biến / Hot</title>
+    <title>🔥 Truyện Phổ Biến / Hot</title>
     <id>urn:xteink:manga:hot</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Tuyển tập các bộ truyện tranh hot nhất</summary>
@@ -70,11 +75,19 @@ def build_root_feed(base_url):
   </entry>
 
   <entry>
-    <title>🆕 TruyenQQ - Mới Cập Nhật</title>
+    <title>🆕 Truyện Mới Cập Nhật</title>
     <id>urn:xteink:manga:new</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Các chương truyện vừa ra mắt</summary>
+    <summary>Các chương truyện vừa ra mắt hôm nay</summary>
     <link rel="subsection" href="{base_url}/opds/list?path=%2Ftruyen-moi" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  </entry>
+
+  <entry>
+    <title>⭐ Truyện Nổi Bật Trang Chủ</title>
+    <id>urn:xteink:manga:home</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Toàn bộ danh sách truyện trang chủ</summary>
+    <link rel="subsection" href="{base_url}/opds/list?path=%2F" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 </feed>'''
 
@@ -237,14 +250,15 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 seen = set()
                 items = []
                 for href, inner in tags:
-                    if href in ['/dang-nhap', '/contact', '/truyen-hot/', '/truyen-moi', '/the-loai/truyen-mau'] or 'the-loai' in href:
+                    if href in ['/dang-nhap', '/contact', '/truyen-hot/', '/truyen-moi', '/the-loai/truyen-mau'] or 'the-loai' in href or 'tai-khoan' in href:
                         continue
                     t = html.unescape(re.sub(r'<[^>]+>', ' ', inner).strip())
-                    if t and len(t) > 3 and href not in seen and not href.endswith('/chapter-1'):
+                    t_clean = re.sub(r'\s*Chapter\s*\d+.*$', '', t, flags=re.IGNORECASE).strip()
+                    if t_clean and len(t_clean) > 2 and href not in seen and not href.endswith('/chapter-1'):
                         seen.add(href)
-                        items.append({'title': t, 'path': href})
+                        items.append({'title': t_clean, 'path': href})
 
-                title = "Truyện Phổ Biến" if 'hot' in category_path else "Truyện Mới"
+                title = "Truyện Phổ Biến" if 'hot' in category_path else ("Truyện Mới" if 'moi' in category_path else "Trang Chủ")
                 xml_data = build_manga_list_feed(base_url, title, items[:35])
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
