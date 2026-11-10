@@ -24,7 +24,6 @@ def get_manga_title(attrs):
     titles = attrs.get('title', {})
     if 'vi' in titles:
         return titles['vi']
-    # Check alternative titles for Vietnamese
     for alt in attrs.get('altTitles', []):
         if 'vi' in alt:
             return alt['vi']
@@ -49,7 +48,6 @@ def build_root_feed(base_url):
   <author><name>Xteink Cloud Bridge</name></author>
   <link rel="self" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
 
   <entry>
     <title>🔥 Truyện Tiếng Việt Xem Nhiều / Hot</title>
@@ -81,14 +79,13 @@ def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
     for item in manga_list:
         m_id = item['id']
         attrs = item.get('attributes', {})
-        title = xml_escape(get_manga_title(attrs))
+        raw_title = get_manga_title(attrs)
+        title = xml_escape(raw_title)
         
-        # Description
         desc_dict = attrs.get('description', {})
         desc_text = desc_dict.get('vi') or desc_dict.get('en') or 'Truyện tranh MangaDex tiếng Việt'
         desc_clean = xml_escape(desc_text[:200] + ('...' if len(desc_text) > 200 else ''))
         
-        # Cover image
         cover_file = get_cover_filename(item.get('relationships', []))
         cover_link_xml = ""
         if cover_file:
@@ -96,13 +93,14 @@ def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
             cover_link_xml = f'''<link rel="http://opds-spec.org/image" href="{cover_url}" type="image/jpeg"/>
     <link rel="http://opds-spec.org/image/thumbnail" href="{cover_url}" type="image/jpeg"/>'''
 
+        safe_manga_title = urllib.parse.quote(raw_title)
         entries.append(f'''  <entry>
     <title>{title}</title>
     <id>urn:mangadex:manga:{m_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>{desc_clean}</summary>
     {cover_link_xml}
-    <link rel="subsection" href="{base_url}/opds/manga?id={m_id}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <link rel="subsection" href="{base_url}/opds/manga?id={m_id}&amp;title={safe_manga_title}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
 
     return f'''<?xml version="1.0" encoding="utf-8"?>
@@ -117,6 +115,14 @@ def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
 
 def build_chapter_feed(base_url, manga_id, manga_title, chapters):
     entries = []
+    if not chapters:
+        entries.append(f'''  <entry>
+    <title>Chưa có chương Tiếng Việt trên máy chủ</title>
+    <id>urn:mangadex:empty:{manga_id}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Bộ truyện này hiện chưa có chương tiếng Việt nào sẵn sàng trên MangaDex. Vui lòng quay lại chọn bộ khác!</summary>
+  </entry>''')
+
     for ch in chapters:
         ch_id = ch['id']
         attrs = ch.get('attributes', {})
@@ -185,8 +191,8 @@ def fetch_chapters(manga_id):
         "limit": 100,
         "translatedLanguage[]": ["vi"],
         "order[chapter]": "desc",
-        "contentRating[]": ["safe", "suggestive", "erotica"],
-        "includeFutureUpdates": "0"
+        "includeExternalUrl": 0,
+        "includeEmptyPages": 0
     }
     res = requests.get(f"{MANGADEX_API}/manga/{manga_id}/feed", headers=HEADERS, params=params, timeout=15)
     res.raise_for_status()
@@ -194,7 +200,6 @@ def fetch_chapters(manga_id):
     return data.get('data', [])
 
 def generate_epub(chapter_id, chapter_title):
-    # 1. Fetch MangaDex At-Home server for chapter images
     res = requests.get(f"{MANGADEX_API}/at-home/server/{chapter_id}", headers=HEADERS, timeout=15)
     res.raise_for_status()
     srv_data = res.json()
@@ -202,14 +207,12 @@ def generate_epub(chapter_id, chapter_title):
     base_url = srv_data.get('baseUrl')
     chapter_info = srv_data.get('chapter', {})
     ch_hash = chapter_info.get('hash')
-    # Use dataSaver for lightweight e-ink transfer, fallback to data
     file_list = chapter_info.get('dataSaver') or chapter_info.get('data') or []
     sub_folder = "data-saver" if chapter_info.get('dataSaver') else "data"
 
     if not file_list:
         raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên MangaDex.")
 
-    # 2. Download and process images
     processed_images = []
     print(f"[*] Đang tải {len(file_list)} trang ảnh cho: {chapter_title}...")
     for idx, fname in enumerate(file_list):
@@ -220,7 +223,6 @@ def generate_epub(chapter_id, chapter_title):
                 im = Image.open(io.BytesIO(r.content))
                 if im.mode != 'L':
                     im = ImageOps.grayscale(im)
-                # Resize for Xteink X4 480x800 e-ink screen
                 im.thumbnail((480, 800), Image.Resampling.LANCZOS)
                 buf = io.BytesIO()
                 im.save(buf, format='JPEG', quality=75, optimize=True)
@@ -231,7 +233,6 @@ def generate_epub(chapter_id, chapter_title):
     if not processed_images:
         raise ValueError("Không thể tải được hình ảnh hợp lệ nào từ chương này.")
 
-    # 3. Create EPUB in-memory
     safe_title = chapter_title or f"Chapter_{chapter_id}"
     esc_safe_title = html.escape(safe_title)
     epub_buf = io.BytesIO()
@@ -361,7 +362,14 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 if not manga_id:
                     self.send_error(400, "Missing manga id")
                     return
-                manga_title = fetch_manga_detail(manga_id)
+                
+                manga_title = qs.get('title', [''])[0]
+                if not manga_title:
+                    try:
+                        manga_title = fetch_manga_detail(manga_id)
+                    except Exception:
+                        manga_title = "Truyện tranh"
+
                 chapters = fetch_chapters(manga_id)
                 xml_data = build_chapter_feed(base_url, manga_id, manga_title, chapters)
                 self.send_response(200)
