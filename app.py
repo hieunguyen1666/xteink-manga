@@ -1,231 +1,320 @@
 import http.server
 import urllib.parse
-import re
+import json
 import os
 import io
 import zipfile
 import html
 import sys
 import traceback
+import requests
 from PIL import Image, ImageOps
 
-try:
-    from curl_cffi import requests
-    USE_CURL = True
-    print("[*] Using curl_cffi for Cloudflare bypass")
-except ImportError:
-    import requests
-    USE_CURL = False
-    print("[!] Fallback to standard requests")
-
-BASE_TRUYENQQ = 'https://truyenqq.com.vn'
-
-def create_session():
-    if USE_CURL:
-        return requests.Session(impersonate="chrome120")
-    s = requests.Session()
-    s.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': 'https://truyenqq.com.vn/'
-    })
-    return s
-
-session = create_session()
-
-def fetch_html(url):
-    if not url.startswith('http'):
-        url = urllib.parse.urljoin(BASE_TRUYENQQ, url)
-    headers = {
-        'Referer': BASE_TRUYENQQ + '/',
-        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-    }
-    resp = session.get(url, headers=headers, timeout=20)
-    resp.encoding = 'utf-8'
-    return resp.text
-
-def fetch_bytes(url):
-    if not url.startswith('http'):
-        url = urllib.parse.urljoin(BASE_TRUYENQQ, url)
-    headers = {
-        'Referer': BASE_TRUYENQQ + '/',
-        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-    }
-    resp = session.get(url, headers=headers, timeout=20)
-    return resp.content
+MANGADEX_API = "https://api.mangadex.org"
+COVER_BASE_URL = "https://uploads.mangadex.org/covers"
+HEADERS = {
+    "User-Agent": "XteinkMangaOPDS/2.0 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
+    "Accept": "application/json"
+}
 
 def xml_escape(text):
     return html.escape(text or '')
 
+def get_manga_title(attrs):
+    titles = attrs.get('title', {})
+    if 'vi' in titles:
+        return titles['vi']
+    # Check alternative titles for Vietnamese
+    for alt in attrs.get('altTitles', []):
+        if 'vi' in alt:
+            return alt['vi']
+    if 'en' in titles:
+        return titles['en']
+    for v in titles.values():
+        return v
+    return "Manga"
+
+def get_cover_filename(relationships):
+    for rel in relationships:
+        if rel.get('type') == 'cover_art':
+            return rel.get('attributes', {}).get('fileName')
+    return None
+
 def build_root_feed(base_url):
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>urn:xteink:manga:root</id>
-  <title>Kho Truyện Tranh (CrossPoint E-Ink)</title>
+  <id>urn:xteink:mangadex:root</id>
+  <title>Manga Tiếng Việt (MangaDex)</title>
   <updated>2026-11-10T00:00:00Z</updated>
-  <author><name>CrossPoint Manga Bridge</name></author>
+  <author><name>Xteink Cloud Bridge</name></author>
   <link rel="self" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
 
   <entry>
-    <title>🔥 Truyện Phổ Biến / Hot</title>
-    <id>urn:xteink:manga:hot</id>
+    <title>🔥 Truyện Tiếng Việt Xem Nhiều / Hot</title>
+    <id>urn:xteink:mangadex:popular</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Tuyển tập các bộ truyện tranh hot nhất</summary>
-    <link rel="subsection" href="{base_url}/opds/list?path=%2Ftruyen-hot%2F" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <summary>Những bộ manga tiếng Việt được theo dõi nhiều nhất</summary>
+    <link rel="subsection" href="{base_url}/opds/list?type=popular" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 
   <entry>
-    <title>🆕 Truyện Mới Cập Nhật</title>
-    <id>urn:xteink:manga:new</id>
+    <title>⭐ Đánh Giá Cao Nhất</title>
+    <id>urn:xteink:mangadex:rating</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Các chương truyện vừa ra mắt hôm nay</summary>
-    <link rel="subsection" href="{base_url}/opds/list?path=%2Ftruyen-moi" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <summary>Manga tiếng Việt có điểm đánh giá cao nhất</summary>
+    <link rel="subsection" href="{base_url}/opds/list?type=rating" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 
   <entry>
-    <title>⭐ Truyện Nổi Bật Trang Chủ</title>
-    <id>urn:xteink:manga:home</id>
+    <title>🆕 Mới Cập Nhật Chương Mới</title>
+    <id>urn:xteink:mangadex:latest</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Toàn bộ danh sách truyện trang chủ</summary>
-    <link rel="subsection" href="{base_url}/opds/list?path=%2F" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <summary>Các bộ truyện vừa có chapter tiếng Việt mới hôm nay</summary>
+    <link rel="subsection" href="{base_url}/opds/list?type=latest" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 </feed>'''
 
-def build_manga_list_feed(base_url, title, items):
+def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
     entries = []
-    for item in items:
-        manga_title = xml_escape(item['title'])
-        manga_path = urllib.parse.quote(item['path'])
+    for item in manga_list:
+        m_id = item['id']
+        attrs = item.get('attributes', {})
+        title = xml_escape(get_manga_title(attrs))
+        
+        # Description
+        desc_dict = attrs.get('description', {})
+        desc_text = desc_dict.get('vi') or desc_dict.get('en') or 'Truyện tranh MangaDex tiếng Việt'
+        desc_clean = xml_escape(desc_text[:200] + ('...' if len(desc_text) > 200 else ''))
+        
+        # Cover image
+        cover_file = get_cover_filename(item.get('relationships', []))
+        cover_link_xml = ""
+        if cover_file:
+            cover_url = f"{COVER_BASE_URL}/{m_id}/{cover_file}.256.jpg"
+            cover_link_xml = f'''<link rel="http://opds-spec.org/image" href="{cover_url}" type="image/jpeg"/>
+    <link rel="http://opds-spec.org/image/thumbnail" href="{cover_url}" type="image/jpeg"/>'''
+
         entries.append(f'''  <entry>
-    <title>{manga_title}</title>
-    <id>urn:xteink:manga:{manga_path}</id>
+    <title>{title}</title>
+    <id>urn:mangadex:manga:{m_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>{manga_title}</summary>
-    <link rel="subsection" href="{base_url}/opds/manga?path={manga_path}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <summary>{desc_clean}</summary>
+    {cover_link_xml}
+    <link rel="subsection" href="{base_url}/opds/manga?id={m_id}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
-    entries_xml = "\n".join(entries)
+
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>urn:xteink:manga:list</id>
-  <title>{xml_escape(title)}</title>
+  <id>urn:xteink:mangadex:{feed_id}</id>
+  <title>{xml_escape(feed_title)}</title>
   <updated>2026-11-10T00:00:00Z</updated>
+  <link rel="self" href="{base_url}/opds/list?type={feed_id}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-{entries_xml}
+{chr(10).join(entries)}
 </feed>'''
 
-def build_chapter_feed(base_url, manga_title, manga_path, chapters):
+def build_chapter_feed(base_url, manga_id, manga_title, chapters):
     entries = []
     for ch in chapters:
-        ch_title = xml_escape(ch['title'])
-        ch_path = urllib.parse.quote(ch['path'])
-        download_url = f"{base_url}/download?url={ch_path}"
+        ch_id = ch['id']
+        attrs = ch.get('attributes', {})
+        ch_num = attrs.get('chapter') or 'OneShot'
+        ch_title = attrs.get('title') or ''
+        full_title = f"Chương {ch_num}" + (f": {ch_title}" if ch_title else "")
+        esc_title = xml_escape(full_title)
+        
+        pages_count = attrs.get('pages', 0)
+        summary = f"{pages_count} trang ảnh - Tiếng Việt" if pages_count else "Tiếng Việt"
+        
+        safe_ch_title = urllib.parse.quote(f"{manga_title} - Chap {ch_num}")
+        download_url = f"{base_url}/download?chapter_id={ch_id}&amp;title={safe_ch_title}"
+
         entries.append(f'''  <entry>
-    <title>{ch_title}</title>
-    <id>urn:xteink:chapter:{ch_path}</id>
+    <title>{esc_title}</title>
+    <id>urn:mangadex:chapter:{ch_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <author><name>TruyenQQ</name></author>
-    <summary>{xml_escape(manga_title)} - {ch_title}</summary>
+    <summary>{summary}</summary>
     <link rel="http://opds-spec.org/acquisition" href="{download_url}" type="application/epub+zip"/>
   </entry>''')
-    entries_xml = "\n".join(entries)
+
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>urn:xteink:manga:{urllib.parse.quote(manga_path)}</id>
+  <id>urn:mangadex:manga:{manga_id}</id>
   <title>{xml_escape(manga_title)}</title>
   <updated>2026-11-10T00:00:00Z</updated>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-{entries_xml}
+{chr(10).join(entries)}
 </feed>'''
 
-def generate_epub(chapter_url):
-    page_html = fetch_html(chapter_url)
-    title_match = re.search(r'<title>(.*?)</title>', page_html)
-    raw_title = title_match.group(1) if title_match else "Manga Chapter"
-    raw_title = html.unescape(raw_title)
-    raw_title = re.sub(r'\s*-\s*TruyenQQ.*', '', raw_title, flags=re.IGNORECASE).strip()
-    raw_title = re.sub(r'[\\/*?:"<>|]', '', raw_title) or "TruyenQQ_Chapter"
+def fetch_mangadex_list(list_type, query=None, limit=30, offset=0):
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "availableTranslatedLanguage[]": ["vi"],
+        "includes[]": ["cover_art"],
+        "contentRating[]": ["safe", "suggestive", "erotica"]
+    }
+    if query:
+        params["title"] = query
+    elif list_type == "popular":
+        params["order[followedCount]"] = "desc"
+    elif list_type == "rating":
+        params["order[rating]"] = "desc"
+    elif list_type == "latest":
+        params["order[latestUploadedChapter]"] = "desc"
+    else:
+        params["order[followedCount]"] = "desc"
 
-    img_urls = re.findall(r'<img[^>]+(?:data-src|data-original|data-cdn)=["\']([^"\']+)["\']', page_html)
-    filtered_imgs = [u for u in img_urls if any(ext in u.lower() for ext in ['.webp', '.jpg', '.jpeg', '.png']) and 'logo' not in u and 'icon' not in u]
-    if not filtered_imgs:
-        all_imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', page_html)
-        filtered_imgs = [u for u in all_imgs if 'chapters' in u]
+    res = requests.get(f"{MANGADEX_API}/manga", headers=HEADERS, params=params, timeout=15)
+    res.raise_for_status()
+    data = res.json()
+    return data.get('data', [])
+
+def fetch_manga_detail(manga_id):
+    res = requests.get(f"{MANGADEX_API}/manga/{manga_id}", headers=HEADERS, timeout=15)
+    res.raise_for_status()
+    data = res.json()
+    item = data.get('data', {})
+    attrs = item.get('attributes', {})
+    return get_manga_title(attrs)
+
+def fetch_chapters(manga_id):
+    params = {
+        "limit": 100,
+        "translatedLanguage[]": ["vi"],
+        "order[chapter]": "desc",
+        "contentRating[]": ["safe", "suggestive", "erotica"],
+        "includeFutureUpdates": "0"
+    }
+    res = requests.get(f"{MANGADEX_API}/manga/{manga_id}/feed", headers=HEADERS, params=params, timeout=15)
+    res.raise_for_status()
+    data = res.json()
+    return data.get('data', [])
+
+def generate_epub(chapter_id, chapter_title):
+    # 1. Fetch MangaDex At-Home server for chapter images
+    res = requests.get(f"{MANGADEX_API}/at-home/server/{chapter_id}", headers=HEADERS, timeout=15)
+    res.raise_for_status()
+    srv_data = res.json()
     
-    seen = set()
-    final_imgs = []
-    for u in filtered_imgs:
-        if u not in seen:
-            seen.add(u)
-            final_imgs.append(u)
+    base_url = srv_data.get('baseUrl')
+    chapter_info = srv_data.get('chapter', {})
+    ch_hash = chapter_info.get('hash')
+    # Use dataSaver for lightweight e-ink transfer, fallback to data
+    file_list = chapter_info.get('dataSaver') or chapter_info.get('data') or []
+    sub_folder = "data-saver" if chapter_info.get('dataSaver') else "data"
 
-    mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, 'w') as zf:
-        zf.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-        zf.writestr('META-INF/container.xml', '''<?xml version="1.0" encoding="UTF-8"?>
+    if not file_list:
+        raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên MangaDex.")
+
+    # 2. Download and process images
+    processed_images = []
+    print(f"[*] Đang tải {len(file_list)} trang ảnh cho: {chapter_title}...")
+    for idx, fname in enumerate(file_list):
+        img_url = f"{base_url}/{sub_folder}/{ch_hash}/{fname}"
+        try:
+            r = requests.get(img_url, headers=HEADERS, timeout=15)
+            if r.status_code == 200:
+                im = Image.open(io.BytesIO(r.content))
+                if im.mode != 'L':
+                    im = ImageOps.grayscale(im)
+                # Resize for Xteink X4 480x800 e-ink screen
+                im.thumbnail((480, 800), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                im.save(buf, format='JPEG', quality=75, optimize=True)
+                processed_images.append(buf.getvalue())
+        except Exception as e:
+            print(f"[!] Lỗi tải trang {idx+1}: {e}")
+
+    if not processed_images:
+        raise ValueError("Không thể tải được hình ảnh hợp lệ nào từ chương này.")
+
+    # 3. Create EPUB in-memory
+    safe_title = chapter_title or f"Chapter_{chapter_id}"
+    esc_safe_title = html.escape(safe_title)
+    epub_buf = io.BytesIO()
+    with zipfile.ZipFile(epub_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+
+        zf.writestr("META-INF/container.xml", '''<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-    <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
-</container>'''.encode('utf-8'))
-        
-        css = '''@page { margin: 0; padding: 0; }
-body { margin: 0; padding: 0; text-align: center; background-color: #ffffff; }
-div.page { width: 100%; height: 100vh; margin: 0; padding: 0; text-align: center; }
-img { max-width: 100%; max-height: 100%; width: auto; height: auto; margin: 0 auto; display: block; }'''
-        zf.writestr('OEBPS/style.css', css.encode('utf-8'))
+    <rootfiles>
+        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+    </rootfiles>
+</container>''')
 
-        manifest_items = [
-            '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
-            '<item id="css" href="style.css" media-type="text/css"/>'
-        ]
-        spine_items = []
+        manifest = ['<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>']
+        spine = []
 
-        for idx, img_url in enumerate(final_imgs, 1):
-            if not img_url.startswith('http'):
-                img_url = urllib.parse.urljoin(chapter_url, img_url)
-
-            try:
-                img_data = fetch_bytes(img_url)
-                with Image.open(io.BytesIO(img_data)) as img:
-                    if img.mode != 'L':
-                        img = img.convert('L')
-                    img = ImageOps.autocontrast(img, cutoff=0.5)
-                    img.thumbnail((480, 800), Image.Resampling.LANCZOS)
-                    
-                    out_io = io.BytesIO()
-                    img.save(out_io, format='JPEG', quality=85, optimize=True)
-                    img_bytes = out_io.getvalue()
-            except Exception:
-                continue
-
-            img_name = f"page_{idx:03d}.jpg"
+        for idx, img_bytes in enumerate(processed_images):
+            num = idx + 1
+            img_name = f"page_{num:03d}.jpg"
+            xhtml_name = f"page_{num:03d}.xhtml"
             zf.writestr(f"OEBPS/images/{img_name}", img_bytes)
-            page_name = f"page_{idx:03d}.xhtml"
-            html_content = f'''<?xml version="1.0" encoding="utf-8"?>
+
+            page_xhtml = f'''<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Trang {idx}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
-<body><div class="page"><img src="images/{img_name}" alt="Page {idx}"/></div></body></html>'''
-            zf.writestr(f"OEBPS/{page_name}", html_content.encode('utf-8'))
-            
-            manifest_items.append(f'<item id="img_{idx}" href="images/{img_name}" media-type="image/jpeg"/>')
-            manifest_items.append(f'<item id="page_{idx}" href="{page_name}" media-type="application/xhtml+xml"/>')
-            spine_items.append(f'<itemref idref="page_{idx}"/>')
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <title>Page {num}</title>
+    <style type="text/css">
+        @page {{ margin: 0; padding: 0; }}
+        body {{ margin: 0; padding: 0; background-color: #ffffff; text-align: center; }}
+        img {{ max-width: 100%; height: auto; display: block; margin: 0 auto; }}
+    </style>
+</head>
+<body>
+    <img src="images/{img_name}" alt="Page {num}"/>
+</body>
+</html>'''
+            zf.writestr(f"OEBPS/{xhtml_name}", page_xhtml)
+            manifest.append(f'<item id="img_{num:03d}" href="images/{img_name}" media-type="image/jpeg"/>')
+            manifest.append(f'<item id="page_{num:03d}" href="{xhtml_name}" media-type="application/xhtml+xml"/>')
+            spine.append(f'<itemref idref="page_{num:03d}"/>')
 
-        opf = f'''<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
-    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{xml_escape(raw_title)}</dc:title><dc:language>vi</dc:language></metadata>
-    <manifest>{"".join(manifest_items)}</manifest><spine toc="ncx">{"".join(spine_items)}</spine>
+        content_opf = f'''<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookID" version="2.0">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <dc:title>{esc_safe_title}</dc:title>
+        <dc:language>vi</dc:language>
+        <dc:identifier id="BookID">urn:mangadex:{chapter_id}</dc:identifier>
+        <dc:creator>MangaDex Scanlator</dc:creator>
+    </metadata>
+    <manifest>
+        {''.join(manifest)}
+    </manifest>
+    <spine toc="ncx">
+        {''.join(spine)}
+    </spine>
 </package>'''
-        zf.writestr('OEBPS/content.opf', opf.encode('utf-8'))
-        
-        ncx = f'''<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><docTitle><text>{xml_escape(raw_title)}</text></docTitle><navMap><navPoint id="nav-1"><navLabel><text>{xml_escape(raw_title)}</text></navLabel><content src="page_001.xhtml"/></navPoint></navMap></ncx>'''
-        zf.writestr('OEBPS/toc.ncx', ncx.encode('utf-8'))
+        zf.writestr("OEBPS/content.opf", content_opf)
 
-    mem_zip.seek(0)
-    return raw_title, mem_zip.getvalue()
+        toc_ncx = f'''<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+    <head>
+        <meta name="dtb:uid" content="urn:mangadex:{chapter_id}"/>
+        <meta name="dtb:depth" content="1"/>
+        <meta name="dtb:totalPageCount" content="0"/>
+        <meta name="dtb:maxPageNumber" content="0"/>
+    </head>
+    <docTitle><text>{esc_safe_title}</text></docTitle>
+    <navMap>
+        <navPoint id="navPoint-1" playOrder="1">
+            <navLabel><text>{esc_safe_title}</text></navLabel>
+            <content src="page_001.xhtml"/>
+        </navPoint>
+    </navMap>
+</ncx>'''
+        zf.writestr("OEBPS/toc.ncx", toc_ncx)
+
+    return safe_title, epub_buf.getvalue()
 
 class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
     def get_base_url(self):
-        proto = self.headers.get('X-Forwarded-Proto') or 'https'
-        host = self.headers.get('Host') or '127.0.0.1:8000'
+        host = self.headers.get('Host', 'xteink-manga.onrender.com')
+        proto = self.headers.get('X-Forwarded-Proto', 'https')
         return f"{proto}://{host}"
 
     def do_GET(self):
@@ -243,61 +332,52 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(xml_data.encode('utf-8'))
 
             elif path == '/opds/list':
-                category_path = qs.get('path', ['/truyen-hot/'])[0]
-                cat_html = fetch_html(category_path)
+                list_type = qs.get('type', ['popular'])[0]
+                feed_title = "Truyện Phổ Biến"
+                if list_type == "rating":
+                    feed_title = "Đánh Giá Cao"
+                elif list_type == "latest":
+                    feed_title = "Mới Cập Nhật"
                 
-                tags = re.findall(r'<a\s+[^>]*href=[\'"]([^\'"]*truyen-tranh/[^\'"]+|/[a-z0-9-]+)[\'"][^>]*>(.*?)</a>', cat_html, re.DOTALL)
-                seen = set()
-                items = []
-                for href, inner in tags:
-                    if href in ['/dang-nhap', '/contact', '/truyen-hot/', '/truyen-moi', '/the-loai/truyen-mau'] or 'the-loai' in href or 'tai-khoan' in href:
-                        continue
-                    t = html.unescape(re.sub(r'<[^>]+>', ' ', inner).strip())
-                    t_clean = re.sub(r'\s*Chapter\s*\d+.*$', '', t, flags=re.IGNORECASE).strip()
-                    if t_clean and len(t_clean) > 2 and href not in seen and not href.endswith('/chapter-1'):
-                        seen.add(href)
-                        items.append({'title': t_clean, 'path': href})
+                manga_list = fetch_mangadex_list(list_type)
+                xml_data = build_manga_list_feed(base_url, feed_title, list_type, manga_list)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
+                self.end_headers()
+                self.wfile.write(xml_data.encode('utf-8'))
 
-                title = "Truyện Phổ Biến" if 'hot' in category_path else ("Truyện Mới" if 'moi' in category_path else "Trang Chủ")
-                xml_data = build_manga_list_feed(base_url, title, items[:35])
+            elif path == '/opds/search':
+                q = qs.get('q', [''])[0].strip()
+                feed_title = f"Tìm kiếm: {q}" if q else "Tìm kiếm"
+                manga_list = fetch_mangadex_list("popular", query=q) if q else []
+                xml_data = build_manga_list_feed(base_url, feed_title, "search", manga_list)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
             elif path == '/opds/manga':
-                manga_path = qs.get('path', [''])[0]
-                manga_html = fetch_html(manga_path)
-                
-                title_m = re.search(r'<h1[^>]*>(.*?)</h1>', manga_html)
-                manga_title = html.unescape(re.sub(r'<[^>]+>', '', title_m.group(1)).strip()) if title_m else "Manga"
-                
-                raw_slug = manga_path.strip('/')
-                ch_regex = rf'<a\s+[^>]*href=["\']([^"\']*{raw_slug}/chapter-[^"\']+)["\'][^>]*>(.*?)</a>'
-                chapters_match = re.findall(ch_regex, manga_html, re.DOTALL)
-                if not chapters_match:
-                    chapters_match = re.findall(r'<a\s+[^>]*href=["\']([^"\']*/chapter-[^"\']+)["\'][^>]*>(.*?)</a>', manga_html, re.DOTALL)
-
-                seen = set()
-                chapters = []
-                for ch_url, ch_inner in chapters_match:
-                    ch_name = html.unescape(re.sub(r'<[^>]+>', '', ch_inner).strip())
-                    if ch_name.lower().startswith("đọc từ đầu"):
-                        continue
-                    if ch_url not in seen and ch_name:
-                        seen.add(ch_url)
-                        chapters.append({'title': ch_name, 'path': ch_url})
-
-                xml_data = build_chapter_feed(base_url, manga_title, manga_path, chapters)
+                manga_id = qs.get('id', [''])[0]
+                if not manga_id:
+                    self.send_error(400, "Missing manga id")
+                    return
+                manga_title = fetch_manga_detail(manga_id)
+                chapters = fetch_chapters(manga_id)
+                xml_data = build_chapter_feed(base_url, manga_id, manga_title, chapters)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
             elif path == '/download':
-                ch_url = qs.get('url', [''])[0]
-                title, epub_bytes = generate_epub(ch_url)
-                safe_name = urllib.parse.quote(f"{title}.epub")
+                chapter_id = qs.get('chapter_id', [''])[0]
+                title = qs.get('title', [f'Manga_{chapter_id}'])[0]
+                if not chapter_id:
+                    self.send_error(400, "Missing chapter_id")
+                    return
+                
+                final_title, epub_bytes = generate_epub(chapter_id, title)
+                safe_name = urllib.parse.quote(f"{final_title}.epub")
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/epub+zip')
                 self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"')
@@ -309,9 +389,10 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
 
         except Exception as e:
             err_msg = traceback.format_exc()
+            print(f"[!] Server Error: {err_msg}", file=sys.stderr)
             xml_err = f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
-  <title>Lỗi kết nối</title>
+  <title>Lỗi MangaDex</title>
   <entry>
     <title>Lỗi: {xml_escape(str(e))}</title>
     <summary>{xml_escape(err_msg)}</summary>
@@ -326,7 +407,7 @@ def run():
     port = int(os.environ.get('PORT', 7860))
     server_address = ('0.0.0.0', port)
     httpd = http.server.ThreadingHTTPServer(server_address, MangaOPDSHandler)
-    print(f"[*] CrossPoint Manga Server on {port}...")
+    print(f"[*] Xteink MangaDex Server running on port {port}...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
