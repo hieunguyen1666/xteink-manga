@@ -9,64 +9,55 @@ import sys
 import time
 import re
 import traceback
+import hashlib
 import requests
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
 
-OTRUYEN_API = "https://otruyenapi.com/v1/api"
-OTRUYEN_IMG_BASE = "https://img.otruyenapi.com/uploads/comics"
+# ==============================================================================
+# Xteink X4 Manga OPDS Cloud Bridge - v5.0 Ultimate
+# - Nguồn 1: NetTruyen (Kho truyện tiếng Việt lớn nhất, đầy đủ Solo Leveling, không DMCA)
+# - Nguồn 2: MangaDex (Kho truyện tranh quốc tế)
+# - Tự động phát hiện DMCA trên MangaDex -> Tự động chuyển link đọc sang NetTruyen
+# - Tối ưu ảnh e-ink 480x800: Tự cắt viền trắng, chia đôi trang ngang, cắt dải cuộn manhwa
+# - Bộ đệm Cache RAM + Đĩa cứng giúp tải siêu tốc, không bị lag
+# ==============================================================================
+
+NETTRUYEN_HOSTS = ["https://nettruyenar.com", "https://nettruyenww.com"]
+NETTRUYEN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Referer": "https://nettruyenar.com/"
+}
+
 MANGADEX_API = "https://api.mangadex.org"
 MANGADEX_COVER_BASE = "https://uploads.mangadex.org/covers"
-
-HEADERS = {
-    "User-Agent": "XteinkMangaOPDS/4.0 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
+MANGADEX_HEADERS = {
+    "User-Agent": "XteinkMangaOPDS/5.0 (Xteink X4 E-Reader Bridge)",
     "Accept": "application/json"
 }
 
-# In-memory cache with 15-minute TTL
-CACHE = {}
+# In-memory cache with TTL
+RAM_CACHE = {}
+
+# On-disk cache for EPUB chapters
+DISK_CACHE_DIR = os.environ.get('CACHE_DIR', '/tmp/xteink_manga_cache' if os.name != 'nt' else 'C:\\Users\\LENOVO\\manga_server\\cache')
+os.makedirs(DISK_CACHE_DIR, exist_ok=True)
 
 def xml_escape(text):
-    return html.escape(text or '')
-
-def get_otruyen_thumb(thumb_url):
-    if not thumb_url:
-        return ""
-    if thumb_url.startswith('http'):
-        return thumb_url
-    clean_thumb = thumb_url.lstrip('/')
-    if clean_thumb.startswith('uploads/comics/'):
-        return f"https://img.otruyenapi.com/{clean_thumb}"
-    return f"{OTRUYEN_IMG_BASE}/{clean_thumb}"
-
-def get_mangadex_title(attrs):
-    titles = attrs.get('title', {})
-    if 'vi' in titles:
-        return titles['vi']
-    for alt in attrs.get('altTitles', []):
-        if 'vi' in alt:
-            return alt['vi']
-    if 'en' in titles:
-        return titles['en']
-    for v in titles.values():
-        return v
-    return "Manga"
-
-def get_mangadex_cover(relationships):
-    for rel in relationships:
-        if rel.get('type') == 'cover_art':
-            return rel.get('attributes', {}).get('fileName')
-    return None
+    return html.escape(str(text or ''))
 
 def parse_num(val):
     try:
         m = re.search(r'(\d+(\.\d+)?)', str(val))
         return float(m.group(1)) if m else -1.0
-    except:
+    except Exception:
         return -1.0
 
-# ----------------- Image Optimization & Slicing (480x800 e-ink) -----------------
+# ------------------------------------------------------------------------------
+# 1. Image Optimization & Slicing Pipeline (480x800 e-ink display)
+# ------------------------------------------------------------------------------
 
 def crop_margins(im, threshold=242, margin_pad=4):
+    """Cắt viền trắng thừa quanh khung tranh để chữ to rõ hơn trên màn hình e-ink."""
     if im.mode != 'L':
         im = ImageOps.grayscale(im)
     w, h = im.size
@@ -79,28 +70,36 @@ def crop_margins(im, threshold=242, margin_pad=4):
         upper = max(0, upper - margin_pad)
         right = min(w, right + margin_pad)
         lower = min(h, lower + margin_pad)
-        if (right - left) > w * 0.65 and (lower - upper) > h * 0.65:
+        # Chỉ crop nếu vùng nội dung hợp lý (tránh mất hình nếu trang vẽ tối)
+        if (right - left) > w * 0.60 and (lower - upper) > h * 0.60:
             return im.crop((left, upper, right, lower))
     return im
 
 def optimize_and_split_image(img_bytes):
+    """
+    Biến đổi ảnh cho máy đọc sách Xteink X4 (480x800):
+    - Cắt viền trắng
+    - Trang đôi ngang -> Cắt đôi thành 2 trang dọc (Phải -> Trái) phóng to 200%
+    - Manhwa cuộn dài -> Cắt thành các khung tile dọc tỉ lệ màn hình e-ink kèm overlap
+    - Tăng tương phản và độ nét (Sharpen) để chữ đen rõ nét trên màn hình E-Ink
+    """
     im = Image.open(io.BytesIO(img_bytes))
     if im.mode != 'L':
         im = ImageOps.grayscale(im)
-    
+
     im = crop_margins(im)
     w, h = im.size
     sub_images = []
-    
+
     if w > h * 1.25:
-        # Trang đôi nằm ngang -> Cắt đôi (Phải trước, Trái sau) phóng to 200%
+        # Trang đôi ngang -> Tách thành 2 trang dọc
         mid = w // 2
         right_page = crop_margins(im.crop((mid, 0, w, h)))
         left_page = crop_margins(im.crop((0, 0, mid, h)))
         sub_images.extend([right_page, left_page])
-    elif h > w * 1.5:
-        # Dải Manhwa / Webtoon cuộn dài -> Cắt thành các khung tỉ lệ màn hình e-ink
-        target_h = int(w * 1.55)
+    elif h > w * 1.55:
+        # Dải Manhwa / Webtoon cuộn dọc dài
+        target_h = int(w * 1.58)
         overlap = int(w * 0.12)
         curr_y = 0
         while curr_y < h:
@@ -112,20 +111,21 @@ def optimize_and_split_image(img_bytes):
             curr_y += (chunk_h - overlap)
     else:
         sub_images.append(im)
-        
+
     final_buffers = []
     for sub in sub_images:
         sub.thumbnail((480, 800), Image.Resampling.LANCZOS)
         sub = ImageOps.autocontrast(sub, cutoff=1)
         sub = sub.filter(ImageFilter.UnsharpMask(radius=1.0, percent=125, threshold=2))
-        
+
         buf = io.BytesIO()
         sub.save(buf, format='JPEG', quality=88, optimize=True, subsampling=0)
         final_buffers.append(buf.getvalue())
-        
+
     return final_buffers
 
 def build_epub_file(book_id, book_title, processed_images):
+    """Đóng gói mảng ảnh tối ưu thành tệp EPUB chuẩn đọc ngay trên CrossPoint Reader."""
     esc_safe_title = html.escape(book_title)
     epub_buf = io.BytesIO()
     with zipfile.ZipFile(epub_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -173,7 +173,7 @@ def build_epub_file(book_id, book_title, processed_images):
         <dc:title>{esc_safe_title}</dc:title>
         <dc:language>vi</dc:language>
         <dc:identifier id="BookID">urn:manga:{book_id}</dc:identifier>
-        <dc:creator>Manga Scanlator</dc:creator>
+        <dc:creator>Xteink Manga Bridge</dc:creator>
     </metadata>
     <manifest>
         {''.join(manifest)}
@@ -204,139 +204,225 @@ def build_epub_file(book_id, book_title, processed_images):
 
     return epub_buf.getvalue()
 
-def generate_otruyen_epub(api_data_url, chapter_title):
-    res = requests.get(api_data_url, headers=HEADERS, timeout=15)
-    res.raise_for_status()
-    payload = res.json()
-    item = payload.get('data', {}).get('item', {})
-    domain_cdn = item.get('domain_cdn', 'https://sv1.otruyencdn.com').rstrip('/')
-    chapter_path = item.get('chapter_path', '').strip('/')
-    images = item.get('chapter_image', [])
-
-    if not images:
-        raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên OTruyen.")
-
-    processed_images = []
-    print(f"[*] [OTruyen] Đang tải và tối ưu {len(images)} trang ảnh cho: {chapter_title}...")
-    for idx, img_info in enumerate(images):
-        fname = img_info.get('image_file') if isinstance(img_info, dict) else str(img_info)
-        if not fname:
-            continue
-        img_url = f"{domain_cdn}/{chapter_path}/{fname}"
-        try:
-            r = requests.get(img_url, headers=HEADERS, timeout=15)
-            if r.status_code == 200:
-                buffers = optimize_and_split_image(r.content)
-                processed_images.extend(buffers)
-        except Exception as e:
-            print(f"[!] Lỗi tải trang {idx+1}: {e}")
-
-    if not processed_images:
-        raise ValueError("Không tải được ảnh hợp lệ nào từ chương OTruyen này.")
-
-    safe_title = chapter_title or "Chapter"
-    epub_bytes = build_epub_file("otruyen", safe_title, processed_images)
-    return safe_title, epub_bytes
-
-def generate_mangadex_epub(chapter_id, chapter_title):
-    res = requests.get(f"{MANGADEX_API}/at-home/server/{chapter_id}", headers=HEADERS, timeout=15)
-    res.raise_for_status()
-    srv_data = res.json()
-    
-    base_url = srv_data.get('baseUrl')
-    chapter_info = srv_data.get('chapter', {})
-    ch_hash = chapter_info.get('hash')
-    file_list = chapter_info.get('dataSaver') or chapter_info.get('data') or []
-    sub_folder = "data-saver" if chapter_info.get('dataSaver') else "data"
-
-    if not file_list:
-        raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên MangaDex.")
-
-    processed_images = []
-    print(f"[*] [MangaDex] Đang tải và tối ưu {len(file_list)} trang ảnh cho: {chapter_title}...")
-    for idx, fname in enumerate(file_list):
-        img_url = f"{base_url}/{sub_folder}/{ch_hash}/{fname}"
-        try:
-            r = requests.get(img_url, headers=HEADERS, timeout=15)
-            if r.status_code == 200:
-                buffers = optimize_and_split_image(r.content)
-                processed_images.extend(buffers)
-        except Exception as e:
-            print(f"[!] Lỗi tải trang {idx+1}: {e}")
-
-    if not processed_images:
-        raise ValueError("Không thể tải được hình ảnh hợp lệ nào từ chương này.")
-
-    safe_title = chapter_title or f"Chapter_{chapter_id}"
-    epub_bytes = build_epub_file(chapter_id, safe_title, processed_images)
-    return safe_title, epub_bytes
-
-def generate_notice_epub(manga_title):
+def generate_dmca_notice_epub(manga_title, nettruyen_url=None):
     safe_title = f"Thong_bao_{manga_title[:20]}"
     esc_title = html.escape(manga_title)
-    
+
     img = Image.new('L', (480, 800), color=255)
     draw = ImageDraw.Draw(img)
-    draw.rectangle([15, 80, 465, 720], outline=0, width=4)
-    draw.text((40, 130), "THONG BAO BAN QUYEN", fill=0)
-    draw.line([40, 160, 440, 160], fill=0, width=2)
-    draw.text((40, 190), "Bo truyen:", fill=0)
-    draw.text((40, 220), f"{manga_title[:35]}", fill=0)
-    draw.text((40, 280), "Chuong tren MangaDex da bi go", fill=0)
-    draw.text((40, 315), "theo yeu cau ban quyen (DMCA).", fill=0)
-    draw.text((40, 380), "GIAI PHAP:", fill=0)
-    draw.text((40, 415), "- Bam nut 'Quay lai' tren may Xteink", fill=0)
-    draw.text((40, 450), "- Chon muc [Kho OTruyen] o Menu chinh", fill=0)
-    draw.text((40, 485), "- Tim bo nay de doc tron bo day du", fill=0)
-    draw.text((40, 520), "  ma khong lo bi khoa ban quyen!", fill=0)
-    
+    draw.rectangle([15, 60, 465, 740], outline=0, width=4)
+    draw.text((40, 100), "THONG BAO BAN QUYEN (DMCA)", fill=0)
+    draw.line([40, 130, 440, 130], fill=0, width=2)
+    draw.text((40, 160), "Bo truyen:", fill=0)
+    draw.text((40, 190), f"{manga_title[:38]}", fill=0)
+    draw.text((40, 250), "Chuong tren MangaDex da bi go", fill=0)
+    draw.text((40, 285), "theo yeu cau ban quyen cua tac gia.", fill=0)
+    draw.text((40, 350), "GIAI PHAP CO SAN:", fill=0)
+    draw.text((40, 385), "- Nhan nut 'Quay lai' tren may X4", fill=0)
+    draw.text((40, 420), "- Chon tiep muc '[TU DONG CHUYEN NGUON]'", fill=0)
+    draw.text((40, 455), "  hoac mo kho 'NetTruyen' o Menu chinh", fill=0)
+    draw.text((40, 490), "- Bo nay co san tron bo tren NetTruyen!", fill=0)
+
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=85)
-    img_bytes = buf.getvalue()
-    epub_bytes = build_epub_file("dmca_notice", esc_title, [img_bytes])
+    epub_bytes = build_epub_file("dmca_notice", esc_title, [buf.getvalue()])
     return safe_title, epub_bytes
 
-# ----------------- Data Fetching Functions -----------------
+# ------------------------------------------------------------------------------
+# 2. NetTruyen Scraper & Engine (Full Vietnamese Content)
+# ------------------------------------------------------------------------------
 
-def fetch_otruyen_list(list_type, page=1):
-    cache_key = f"otruyen_list_{list_type}_{page}"
+def make_nettruyen_request(path_or_url, is_ajax=False, timeout=12):
+    """Gửi yêu cầu đến NetTruyen với cơ chế tự động chuyển đổi host khi cần."""
+    last_err = None
+    for host in NETTRUYEN_HOSTS:
+        url = path_or_url if path_or_url.startswith('http') else f"{host}{path_or_url}"
+        headers = dict(NETTRUYEN_HEADERS)
+        headers['Referer'] = f"{host}/"
+        if is_ajax:
+            headers['X-Requested-With'] = 'XMLHttpRequest'
+        try:
+            res = requests.get(url, headers=headers, timeout=timeout)
+            if res.status_code == 200:
+                return res
+        except Exception as e:
+            last_err = e
+            continue
+    raise ConnectionError(f"Không thể kết nối đến NetTruyen: {last_err}")
+
+def parse_nettruyen_items(html_text):
+    """Trích xuất danh sách truyện từ mã nguồn HTML NetTruyen."""
+    items = []
+    blocks = re.findall(r'<div class="item"[^>]*>([\s\S]*?)</figcaption>', html_text)
+    for b in blocks:
+        h3 = re.search(r'<h3[^>]*>([\s\S]*?)</h3>', b)
+        thumb = re.search(r'data-original="([^"]+)"', b)
+        if h3:
+            a = re.search(r'href="([^"]+)"[^>]*>([^<]+)</a>', h3.group(1))
+            if a:
+                href = a.group(1)
+                title = a.group(2).strip()
+                m = re.search(r'/truyen-tranh/(?P<slug>.+)-(?P<id>\d+)', href)
+                if m:
+                    slug = m.group('slug')
+                    comic_id = m.group('id')
+                    
+                    # Tìm chapter mới nhất
+                    ch_match = re.search(r'<a[^>]*href="[^"]*/chapter-[^"]*"[^>]*>([^<]+)</a>', b)
+                    latest_ch = ch_match.group(1).strip() if ch_match else ''
+                    
+                    thumb_url = thumb.group(1) if thumb else ''
+                    if thumb_url.startswith('//'):
+                        thumb_url = 'https:' + thumb_url
+
+                    items.append({
+                        'title': title,
+                        'slug': slug,
+                        'id': comic_id,
+                        'url': href,
+                        'thumb': thumb_url,
+                        'latest_chapter': latest_ch
+                    })
+    return items
+
+def fetch_nettruyen_list(list_type, page=1):
+    cache_key = f"nt_list_{list_type}_{page}"
     now = time.time()
-    if cache_key in CACHE:
-        ts, cached = CACHE[cache_key]
+    if cache_key in RAM_CACHE:
+        ts, data = RAM_CACHE[cache_key]
         if now - ts < 600:
-            return cached
+            return data
 
-    url = f"{OTRUYEN_API}/danh-sach/{list_type}?page={page}"
-    res = requests.get(url, headers=HEADERS, timeout=15)
-    res.raise_for_status()
-    data = res.json().get('data', {})
-    items = data.get('items', [])
-    pagination = data.get('params', {}).get('pagination', {})
-    result = (items, pagination)
-    CACHE[cache_key] = (now, result)
+    if list_type == 'hot':
+        path = f"/truyen-tranh-hot?page={page}"
+    else:
+        path = f"/?page={page}"
+
+    res = make_nettruyen_request(path)
+    items = parse_nettruyen_items(res.text)
+    
+    # Tìm tổng số trang nếu có
+    total_pages = 500
+    page_matches = re.findall(r'[?&]page=(\d+)', res.text)
+    if page_matches:
+        try:
+            total_pages = max(int(p) for p in page_matches)
+        except Exception:
+            pass
+
+    result = (items, total_pages)
+    RAM_CACHE[cache_key] = (now, result)
     return result
 
-def fetch_otruyen_search(keyword, page=1):
-    url = f"{OTRUYEN_API}/tim-kiem?keyword={urllib.parse.quote(keyword)}&page={page}"
-    res = requests.get(url, headers=HEADERS, timeout=15)
-    res.raise_for_status()
-    data = res.json().get('data', {})
-    return data.get('items', [])
+def fetch_nettruyen_search(keyword, page=1):
+    q_enc = urllib.parse.quote_plus(keyword)
+    path = f"/tim-truyen?keyword={q_enc}&page={page}"
+    res = make_nettruyen_request(path)
+    return parse_nettruyen_items(res.text)
 
-def fetch_otruyen_detail(slug):
-    cache_key = f"otruyen_detail_{slug}"
+def fetch_nettruyen_chapters(slug, comic_id):
+    """Lấy danh sách toàn bộ chương từ AJAX service của NetTruyen."""
+    cache_key = f"nt_ch_{comic_id}"
     now = time.time()
-    if cache_key in CACHE:
-        ts, cached = CACHE[cache_key]
+    if cache_key in RAM_CACHE:
+        ts, data = RAM_CACHE[cache_key]
         if now - ts < 900:
-            return cached
+            return data
 
-    url = f"{OTRUYEN_API}/truyen-tranh/{slug}"
-    res = requests.get(url, headers=HEADERS, timeout=15)
-    res.raise_for_status()
-    item = res.json().get('data', {}).get('item', {})
-    CACHE[cache_key] = (now, item)
-    return item
+    path = f"/Comic/Services/ComicService.asmx/ChapterList?slug={slug}&comicId={comic_id}"
+    res = make_nettruyen_request(path, is_ajax=True)
+    payload = res.json()
+    chapters = payload.get('data', [])
+    RAM_CACHE[cache_key] = (now, chapters)
+    return chapters
+
+def fetch_nettruyen_chapter_images(slug, chapter_slug, chapter_id):
+    """Lấy danh sách URL ảnh trong 1 chương của NetTruyen."""
+    path = f"/truyen-tranh/{slug}/{chapter_slug}/{chapter_id}"
+    res = make_nettruyen_request(path)
+    html_text = res.text
+
+    imgs = re.findall(r'<div class=[\'"]page-chapter[\'"][^>]*>[\s\S]*?<img[^>]*data-src=[\'"]([^\'"]+)[\'"]', html_text)
+    if not imgs:
+        imgs = re.findall(r'<div class=[\'"]page-chapter[\'"][^>]*>[\s\S]*?<img[^>]*data-original=[\'"]([^\'"]+)[\'"]', html_text)
+    if not imgs:
+        imgs = re.findall(r'<div class=[\'"]page-chapter[\'"][^>]*>[\s\S]*?<img[^>]*data-sv1=[\'"]([^\'"]+)[\'"]', html_text)
+    if not imgs:
+        imgs = re.findall(r'data-original=[\'"]([^\'"]+\.(?:jpg|jpeg|png|webp))[\'"]', html_text)
+
+    clean_imgs = []
+    for u in imgs:
+        if u.startswith('//'):
+            clean_imgs.append('https:' + u)
+        elif u.startswith('http'):
+            clean_imgs.append(u)
+    return clean_imgs
+
+def generate_nettruyen_epub(slug, chapter_slug, chapter_id, chapter_title):
+    """Tải và đóng gói chương truyện NetTruyen thành file EPUB tối ưu cho máy đọc sách."""
+    disk_file = os.path.join(DISK_CACHE_DIR, f"nt_{chapter_id}.epub")
+    if os.path.exists(disk_file) and os.path.getsize(disk_file) > 1024:
+        print(f"[*] Phục vụ từ Cache đĩa cứng: {disk_file}")
+        with open(disk_file, 'rb') as f:
+            return chapter_title, f.read()
+
+    images = fetch_nettruyen_chapter_images(slug, chapter_slug, chapter_id)
+    if not images:
+        raise ValueError(f"Không tìm thấy hình ảnh nào trong chương '{chapter_title}' trên NetTruyen.")
+
+    processed_images = []
+    print(f"[*] [NetTruyen] Đang tải và xử lý {len(images)} trang ảnh cho: {chapter_title}...")
+    headers = {
+        "User-Agent": NETTRUYEN_HEADERS["User-Agent"],
+        "Referer": "https://nettruyenar.com/"
+    }
+
+    for idx, img_url in enumerate(images):
+        try:
+            r = requests.get(img_url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                buffers = optimize_and_split_image(r.content)
+                processed_images.extend(buffers)
+        except Exception as e:
+            print(f"[!] Lỗi tải ảnh {idx+1}: {e}")
+
+    if not processed_images:
+        raise ValueError("Không thể tải được trang ảnh hợp lệ nào từ chương này.")
+
+    safe_title = chapter_title or f"Chapter_{chapter_id}"
+    epub_bytes = build_epub_file(f"nt_{chapter_id}", safe_title, processed_images)
+
+    # Lưu vào đĩa cache
+    try:
+        with open(disk_file, 'wb') as f:
+            f.write(epub_bytes)
+    except Exception as e:
+        print(f"[!] Không thể lưu cache: {e}")
+
+    return safe_title, epub_bytes
+
+# ------------------------------------------------------------------------------
+# 3. MangaDex Scraper & Engine (Global Content)
+# ------------------------------------------------------------------------------
+
+def get_mangadex_title(attrs):
+    titles = attrs.get('title', {})
+    if 'vi' in titles:
+        return titles['vi']
+    for alt in attrs.get('altTitles', []):
+        if 'vi' in alt:
+            return alt['vi']
+    if 'en' in titles:
+        return titles['en']
+    for v in titles.values():
+        return v
+    return "Manga"
+
+def get_mangadex_cover(relationships):
+    for rel in relationships:
+        if rel.get('type') == 'cover_art':
+            return rel.get('attributes', {}).get('fileName')
+    return None
 
 def fetch_mangadex_list(list_type, query=None, limit=30, offset=0):
     params = {
@@ -357,23 +443,23 @@ def fetch_mangadex_list(list_type, query=None, limit=30, offset=0):
     else:
         params["order[followedCount]"] = "desc"
 
-    res = requests.get(f"{MANGADEX_API}/manga", headers=HEADERS, params=params, timeout=15)
+    res = requests.get(f"{MANGADEX_API}/manga", headers=MANGADEX_HEADERS, params=params, timeout=15)
     res.raise_for_status()
     return res.json().get('data', [])
 
 def fetch_mangadex_detail(manga_id):
-    res = requests.get(f"{MANGADEX_API}/manga/{manga_id}", headers=HEADERS, timeout=15)
+    res = requests.get(f"{MANGADEX_API}/manga/{manga_id}", headers=MANGADEX_HEADERS, timeout=15)
     res.raise_for_status()
     item = res.json().get('data', {})
     return get_mangadex_title(item.get('attributes', {}))
 
 def fetch_mangadex_chapters(manga_id):
     now = time.time()
-    cache_key = f"mangadex_ch_{manga_id}"
-    if cache_key in CACHE:
-        ts, cached = CACHE[cache_key]
+    cache_key = f"md_ch_{manga_id}"
+    if cache_key in RAM_CACHE:
+        ts, data = RAM_CACHE[cache_key]
         if now - ts < 900:
-            return cached
+            return data
 
     params = {
         "limit": 500,
@@ -382,60 +468,113 @@ def fetch_mangadex_chapters(manga_id):
         "includeExternalUrl": 0,
         "includeEmptyPages": 0
     }
-    res = requests.get(f"{MANGADEX_API}/manga/{manga_id}/feed", headers=HEADERS, params=params, timeout=15)
+    res = requests.get(f"{MANGADEX_API}/manga/{manga_id}/feed", headers=MANGADEX_HEADERS, params=params, timeout=15)
     res.raise_for_status()
     chapters = res.json().get('data', [])
-    CACHE[cache_key] = (now, chapters)
+    RAM_CACHE[cache_key] = (now, chapters)
     return chapters
 
-# ----------------- OPDS Feed Builders -----------------
+def generate_mangadex_epub(chapter_id, chapter_title):
+    disk_file = os.path.join(DISK_CACHE_DIR, f"md_{chapter_id}.epub")
+    if os.path.exists(disk_file) and os.path.getsize(disk_file) > 1024:
+        print(f"[*] Phục vụ từ Cache đĩa cứng: {disk_file}")
+        with open(disk_file, 'rb') as f:
+            return chapter_title, f.read()
+
+    res = requests.get(f"{MANGADEX_API}/at-home/server/{chapter_id}", headers=MANGADEX_HEADERS, timeout=15)
+    res.raise_for_status()
+    srv_data = res.json()
+
+    base_url = srv_data.get('baseUrl')
+    chapter_info = srv_data.get('chapter', {})
+    ch_hash = chapter_info.get('hash')
+    file_list = chapter_info.get('dataSaver') or chapter_info.get('data') or []
+    sub_folder = "data-saver" if chapter_info.get('dataSaver') else "data"
+
+    if not file_list:
+        raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên MangaDex.")
+
+    processed_images = []
+    print(f"[*] [MangaDex] Đang tải và tối ưu {len(file_list)} trang ảnh cho: {chapter_title}...")
+    for idx, fname in enumerate(file_list):
+        img_url = f"{base_url}/{sub_folder}/{ch_hash}/{fname}"
+        try:
+            r = requests.get(img_url, headers=MANGADEX_HEADERS, timeout=15)
+            if r.status_code == 200:
+                buffers = optimize_and_split_image(r.content)
+                processed_images.extend(buffers)
+        except Exception as e:
+            print(f"[!] Lỗi tải trang {idx+1}: {e}")
+
+    if not processed_images:
+        raise ValueError("Không thể tải được hình ảnh hợp lệ nào từ chương này.")
+
+    safe_title = chapter_title or f"Chapter_{chapter_id}"
+    epub_bytes = build_epub_file(chapter_id, safe_title, processed_images)
+
+    try:
+        with open(disk_file, 'wb') as f:
+            f.write(epub_bytes)
+    except Exception:
+        pass
+
+    return safe_title, epub_bytes
+
+# ------------------------------------------------------------------------------
+# 4. OPDS Feeds Construction
+# ------------------------------------------------------------------------------
+
+def format_feed(base_url, feed_id, feed_title, entries):
+    return f'''<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:xteink:{feed_id}</id>
+  <title>{xml_escape(feed_title)}</title>
+  <updated>2026-11-10T00:00:00Z</updated>
+  <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+{chr(10).join(entries)}
+</feed>'''
 
 def build_root_feed(base_url):
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
   <id>urn:xteink:root</id>
-  <title>Kho Truyện Tranh (E-Ink Bridge)</title>
+  <title>Kho Truyện Tranh (Xteink X4 E-Ink)</title>
   <updated>2026-11-10T00:00:00Z</updated>
-  <author><name>Xteink Cloud Bridge</name></author>
+  <author><name>Xteink Cloud Bridge v5.0</name></author>
   <link rel="self" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
 
   <entry>
-    <title>🔍 Tìm Kiếm Truyện Nhanh (Gõ Tên / Gợi Ý)</title>
+    <title>🔍 Tìm Kiếm Nhanh (Gõ Tên / Gợi Ý Hot)</title>
     <id>urn:xteink:search_menu</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Tìm kiếm nhanh trên cả OTruyen và MangaDex hoặc chọn danh mục gợi ý</summary>
+    <summary>Tìm kiếm nhanh trên toàn bộ kho truyện tiếng Việt</summary>
     <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
     <link rel="subsection" href="{base_url}/opds/search_shortcuts" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   </entry>
 
   <entry>
-    <title>📚 [OTruyen] Mới Cập Nhật (Đầy Đủ, Không DMCA)</title>
-    <id>urn:xteink:otruyen:truyenmoi</id>
+    <title>🌟 [NetTruyen] Truyện Mới Cập Nhật (Đầy Đủ, Không DMCA)</title>
+    <id>urn:xteink:nettruyen:new</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Truyện tranh tiếng Việt mới nhất, không bị hạn chế bản quyền</summary>
-    <link rel="subsection" href="{base_url}/opds/otruyen/list?type=truyen-moi" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <summary>Kho truyện tiếng Việt phong phú nhất, cập nhật liên tục từng giờ</summary>
+    <link rel="subsection" href="{base_url}/opds/nettruyen/list?type=new" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 
   <entry>
-    <title>🔥 [OTruyen] Đang Phát Hành / Hot</title>
-    <id>urn:xteink:otruyen:dangphathanh</id>
-    <summary>Các bộ truyện tranh đang ra chap mới cực hot trên OTruyen</summary>
-    <link rel="subsection" href="{base_url}/opds/otruyen/list?type=dang-phat-hanh" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
-  </entry>
-
-  <entry>
-    <title>🏆 [OTruyen] Trọn Bộ Hoàn Thành (Solo Leveling...)</title>
-    <id>urn:xteink:otruyen:hoanthanh</id>
-    <summary>Các bộ truyện đã hoàn thành trọn bộ (Tôi Thăng Cấp Một Mình full 239 chap...)</summary>
-    <link rel="subsection" href="{base_url}/opds/otruyen/list?type=hoan-thanh" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <title>🔥 [NetTruyen] Truyện Hot / Xem Nhiều (Solo Leveling...)</title>
+    <id>urn:xteink:nettruyen:hot</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Các bộ truyện tranh đỉnh cao: Tôi Thăng Cấp Một Mình, Manhwa, Shounen...</summary>
+    <link rel="subsection" href="{base_url}/opds/nettruyen/list?type=hot" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 
   <entry>
     <title>🌐 [MangaDex] Truyện Quốc Tế Xem Nhiều</title>
     <id>urn:xteink:mangadex:popular</id>
-    <summary>Kho truyện MangaDex quốc tế có bản dịch tiếng Việt</summary>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Kho truyện tranh toàn cầu có bản dịch tiếng Việt</summary>
     <link rel="subsection" href="{base_url}/opds/mangadex/list?type=popular" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 
@@ -443,7 +582,7 @@ def build_root_feed(base_url):
     <title>⭐ [MangaDex] Đánh Giá Cao Nhất</title>
     <id>urn:xteink:mangadex:rating</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Manga tiếng Việt có điểm đánh giá cao nhất trên MangaDex</summary>
+    <summary>Các bộ truyện được cộng đồng quốc tế đánh giá cao nhất</summary>
     <link rel="subsection" href="{base_url}/opds/mangadex/list?type=rating" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 </feed>'''
@@ -475,74 +614,76 @@ def build_search_shortcuts_feed(base_url):
 {chr(10).join(entries)}
 </feed>'''
 
-# ----------------- OTruyen Feeds -----------------
+# --- NetTruyen OPDS Feeds ---
 
-def build_otruyen_list_feed(base_url, feed_title, list_type, items, page=1, total_pages=1):
+def build_nettruyen_list_feed(base_url, feed_title, list_type, items, page=1, total_pages=500):
     entries = []
     for item in items:
-        name = item.get('name', 'Truyện')
-        slug = item.get('slug', '')
-        thumb_url = get_otruyen_thumb(item.get('thumb_url', ''))
-        status = item.get('status', '')
-        summary = f"Trạng thái: {status}" if status else "Truyện tranh OTruyen tiếng Việt"
-        
+        title = item['title']
+        slug = item['slug']
+        c_id = item['id']
+        thumb = item['thumb']
+        latest = item.get('latest_chapter', '')
+
+        summary = f"Mới nhất: {latest}" if latest else "Truyện tranh NetTruyen tiếng Việt"
         cover_xml = ""
-        if thumb_url:
-            cover_xml = f'''<link rel="http://opds-spec.org/image" href="{thumb_url}" type="image/jpeg"/>
-    <link rel="http://opds-spec.org/image/thumbnail" href="{thumb_url}" type="image/jpeg"/>'''
+        if thumb:
+            cover_xml = f'''<link rel="http://opds-spec.org/image" href="{thumb}" type="image/jpeg"/>
+    <link rel="http://opds-spec.org/image/thumbnail" href="{thumb}" type="image/jpeg"/>'''
 
         safe_slug = urllib.parse.quote(slug)
-        safe_title = urllib.parse.quote(name)
+        safe_title = urllib.parse.quote(title)
+        manga_url = f"{base_url}/opds/nettruyen/manga?slug={safe_slug}&amp;id={c_id}&amp;title={safe_title}"
+
         entries.append(f'''  <entry>
-    <title>{xml_escape(name)}</title>
-    <id>urn:otruyen:manga:{safe_slug}</id>
+    <title>{xml_escape(title)}</title>
+    <id>urn:nettruyen:manga:{c_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>{xml_escape(summary)}</summary>
     {cover_xml}
-    <link rel="subsection" href="{base_url}/opds/otruyen/manga?slug={safe_slug}&amp;title={safe_title}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <link rel="subsection" href="{manga_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
 
     if page < total_pages:
         next_page = page + 1
-        next_url = f"{base_url}/opds/otruyen/list?type={list_type}&amp;page={next_page}"
+        next_url = f"{base_url}/opds/nettruyen/list?type={list_type}&amp;page={next_page}"
         entries.append(f'''  <entry>
     <title>⏩ Trang Tiếp Theo (Trang {next_page} / {total_pages})</title>
-    <id>urn:otruyen:page:{list_type}:{next_page}</id>
+    <id>urn:nettruyen:page:{list_type}:{next_page}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Xem thêm các bộ truyện ở trang tiếp theo</summary>
+    <summary>Xem thêm các bộ truyện ở trang sau</summary>
     <link rel="subsection" href="{next_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
 
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>urn:otruyen:list:{list_type}:{page}</id>
+  <id>urn:nettruyen:list:{list_type}:{page}</id>
   <title>{xml_escape(feed_title)} (Trang {page})</title>
   <updated>2026-11-10T00:00:00Z</updated>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
 {chr(10).join(entries)}
 </feed>'''
 
-def create_otruyen_chapter_entry(base_url, manga_title, ch):
+def create_nettruyen_chapter_entry(base_url, slug, manga_title, ch):
+    ch_id = ch.get('chapter_id')
     ch_name = ch.get('chapter_name', '1')
-    ch_title = ch.get('chapter_title', '')
-    api_data_url = ch.get('chapter_api_data', '')
+    ch_slug = ch.get('chapter_slug', f"chapter-{ch_id}")
     
-    full_title = f"Chương {ch_name}" + (f": {ch_title}" if ch_title else "")
+    full_title = f"{ch_name}"
     esc_title = xml_escape(full_title)
-    
-    safe_title = urllib.parse.quote(f"{manga_title} - Chap {ch_name}")
-    safe_api = urllib.parse.quote(api_data_url)
-    download_url = f"{base_url}/download_otruyen?api_data={safe_api}&amp;title={safe_title}"
+
+    safe_title = urllib.parse.quote(f"{manga_title} - {ch_name}")
+    download_url = f"{base_url}/download_nettruyen?slug={urllib.parse.quote(slug)}&amp;chapter_slug={urllib.parse.quote(ch_slug)}&amp;chapter_id={ch_id}&amp;title={safe_title}"
 
     return f'''  <entry>
     <title>{esc_title}</title>
-    <id>urn:otruyen:chapter:{urllib.parse.quote(ch_name)}</id>
+    <id>urn:nettruyen:chapter:{ch_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Đọc chương {ch_name} nguồn OTruyen</summary>
+    <summary>Tải và đọc chương {ch_name} (NetTruyen)</summary>
     <link rel="http://opds-spec.org/acquisition" href="{download_url}" type="application/epub+zip"/>
   </entry>'''
 
-def build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order='desc', range_param=None, search_q=None):
+def build_nettruyen_chapter_feed(base_url, slug, comic_id, manga_title, chapters, order='desc', range_param=None, search_q=None):
     entries = []
     safe_slug = urllib.parse.quote(slug)
     safe_title = urllib.parse.quote(manga_title)
@@ -550,11 +691,11 @@ def build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order='des
     if not chapters:
         entries.append(f'''  <entry>
     <title>Chưa có chương nào sẵn sàng</title>
-    <id>urn:otruyen:empty:{safe_slug}</id>
+    <id>urn:nettruyen:empty:{comic_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Bộ truyện này hiện chưa có tập truyện nào được cập nhật trên OTruyen.</summary>
+    <summary>Bộ truyện này hiện chưa có tập truyện nào được cập nhật trên NetTruyen.</summary>
   </entry>''')
-        return format_feed(base_url, f"otruyen:{slug}", manga_title, entries)
+        return format_feed(base_url, f"nettruyen:{comic_id}", manga_title, entries)
 
     sorted_asc = sorted(chapters, key=lambda c: parse_num(c.get('chapter_name', '0')))
     sorted_desc = sorted(chapters, key=lambda c: parse_num(c.get('chapter_name', '0')), reverse=True)
@@ -564,20 +705,19 @@ def build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order='des
     first_num = first_ch.get('chapter_name', '1')
     latest_num = latest_ch.get('chapter_name', 'Mới')
 
-    # 1. Chế độ tìm số chương
+    # 1. Tìm kiếm số chương
     if search_q:
         q_lower = search_q.strip().lower()
         matched = []
         for ch in sorted_desc:
             c_name = str(ch.get('chapter_name', '')).lower()
-            c_title = str(ch.get('chapter_title', '')).lower()
-            if q_lower == c_name or f"chương {q_lower}" in c_title or q_lower in c_title:
+            if q_lower == c_name or f"chapter {q_lower}" == c_name or f"chương {q_lower}" == c_name or q_lower in c_name:
                 matched.append(ch)
 
-        back_url = f"{base_url}/opds/otruyen/manga?slug={safe_slug}&amp;title={safe_title}"
+        back_url = f"{base_url}/opds/nettruyen/manga?slug={safe_slug}&amp;id={comic_id}&amp;title={safe_title}"
         entries.append(f'''  <entry>
     <title>« Quay Lại Danh Mục Chương</title>
-    <id>urn:otruyen:back:{safe_slug}</id>
+    <id>urn:nettruyen:back:{comic_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Xem toàn bộ danh mục chương</summary>
     <link rel="subsection" href="{back_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
@@ -586,56 +726,54 @@ def build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order='des
         if not matched:
             entries.append(f'''  <entry>
     <title>Không tìm thấy chương nào khớp với "{xml_escape(search_q)}"</title>
-    <id>urn:otruyen:notfound:{safe_slug}</id>
+    <id>urn:nettruyen:notfound:{comic_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Vui lòng thử gõ số chương khác hoặc bấm 'Quay Lại'</summary>
   </entry>''')
         else:
             for ch in matched:
-                entries.append(create_otruyen_chapter_entry(base_url, manga_title, ch))
-        return format_feed(base_url, f"otruyen:{slug}", f"{manga_title} (Tìm số: {search_q})", entries)
+                entries.append(create_nettruyen_chapter_entry(base_url, slug, manga_title, ch))
+        return format_feed(base_url, f"nettruyen:{comic_id}", f"{manga_title} (Tìm số: {search_q})", entries)
 
-    # 2. Chế độ xem theo khoảng chương (Range)
+    # 2. Xem theo khoảng chương (Range)
     if range_param:
         try:
             start_idx, end_idx = map(int, range_param.split('-'))
-        except:
+        except Exception:
             start_idx, end_idx = 0, 40
 
         active_list = sorted_asc if order == 'asc' else sorted_desc
         subset = active_list[start_idx:end_idx]
 
-        back_url = f"{base_url}/opds/otruyen/manga?slug={safe_slug}&amp;title={safe_title}&amp;order={order}"
+        back_url = f"{base_url}/opds/nettruyen/manga?slug={safe_slug}&amp;id={comic_id}&amp;title={safe_title}&amp;order={order}"
         entries.append(f'''  <entry>
     <title>« Quay Lại Toàn Bộ Chương</title>
-    <id>urn:otruyen:back:{safe_slug}</id>
+    <id>urn:nettruyen:back:{comic_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Trở về danh mục phân đoạn chương</summary>
     <link rel="subsection" href="{back_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
 
         for ch in subset:
-            entries.append(create_otruyen_chapter_entry(base_url, manga_title, ch))
-            
-        r_title = f"{manga_title} (Khoảng {start_idx+1} - {min(end_idx, len(active_list))})"
-        return format_feed(base_url, f"otruyen:{slug}", r_title, entries)
+            entries.append(create_nettruyen_chapter_entry(base_url, slug, manga_title, ch))
 
-    # 3. Chế độ mặc định: Phím tắt + Phân đoạn
-    first_safe_api = urllib.parse.quote(first_ch.get('chapter_api_data', ''))
-    first_download = f"{base_url}/download_otruyen?api_data={first_safe_api}&amp;title={urllib.parse.quote(f'{manga_title} - Chap {first_num}')}"
+        r_title = f"{manga_title} (Khoảng {start_idx+1} - {min(end_idx, len(active_list))})"
+        return format_feed(base_url, f"nettruyen:{comic_id}", r_title, entries)
+
+    # 3. Chế độ Mặc Định: Phím tắt + Phân đoạn
+    first_download = f"{base_url}/download_nettruyen?slug={safe_slug}&amp;chapter_slug={urllib.parse.quote(first_ch.get('chapter_slug', ''))}&amp;chapter_id={first_ch.get('chapter_id')}&amp;title={urllib.parse.quote(f'{manga_title} - {first_num}')}"
     entries.append(f'''  <entry>
-    <title>⭐ [ĐỌC TỪ ĐẦU] Chương {first_num}</title>
-    <id>urn:otruyen:readfirst:{safe_slug}</id>
+    <title>⭐ [ĐỌC TỪ ĐẦU] {first_num}</title>
+    <id>urn:nettruyen:readfirst:{comic_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Tải và đọc ngay từ chương đầu tiên</summary>
     <link rel="http://opds-spec.org/acquisition" href="{first_download}" type="application/epub+zip"/>
   </entry>''')
 
-    latest_safe_api = urllib.parse.quote(latest_ch.get('chapter_api_data', ''))
-    latest_download = f"{base_url}/download_otruyen?api_data={latest_safe_api}&amp;title={urllib.parse.quote(f'{manga_title} - Chap {latest_num}')}"
+    latest_download = f"{base_url}/download_nettruyen?slug={safe_slug}&amp;chapter_slug={urllib.parse.quote(latest_ch.get('chapter_slug', ''))}&amp;chapter_id={latest_ch.get('chapter_id')}&amp;title={urllib.parse.quote(f'{manga_title} - {latest_num}')}"
     entries.append(f'''  <entry>
-    <title>🔥 [ĐỌC MỚI NHẤT] Chương {latest_num}</title>
-    <id>urn:otruyen:readlatest:{safe_slug}</id>
+    <title>🔥 [ĐỌC MỚI NHẤT] {latest_num}</title>
+    <id>urn:nettruyen:readlatest:{comic_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Tải và đọc ngay chương mới nhất</summary>
     <link rel="http://opds-spec.org/acquisition" href="{latest_download}" type="application/epub+zip"/>
@@ -643,10 +781,10 @@ def build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order='des
 
     next_order = 'asc' if order == 'desc' else 'desc'
     order_label = "Từ Chương 1 -> Mới nhất" if order == 'desc' else "Mới nhất -> Cũ nhất"
-    order_toggle_url = f"{base_url}/opds/otruyen/manga?slug={safe_slug}&amp;order={next_order}&amp;title={safe_title}"
+    order_toggle_url = f"{base_url}/opds/nettruyen/manga?slug={safe_slug}&amp;id={comic_id}&amp;order={next_order}&amp;title={safe_title}"
     entries.append(f'''  <entry>
     <title>🔄 Đổi Thứ Tự: Xem [{order_label}]</title>
-    <id>urn:otruyen:order:{safe_slug}:{next_order}</id>
+    <id>urn:nettruyen:order:{comic_id}:{next_order}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Bấm vào đây để đảo chiều danh sách chương</summary>
     <link rel="subsection" href="{order_toggle_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
@@ -659,21 +797,21 @@ def build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order='des
             chunk = active_list[i:i+chunk_size]
             c_start = chunk[0].get('chapter_name') or str(i+1)
             c_end = chunk[-1].get('chapter_name') or str(i+len(chunk))
-            range_url = f"{base_url}/opds/otruyen/manga?slug={safe_slug}&amp;range={i}-{i+chunk_size}&amp;order={order}&amp;title={safe_title}"
+            range_url = f"{base_url}/opds/nettruyen/manga?slug={safe_slug}&amp;id={comic_id}&amp;range={i}-{i+chunk_size}&amp;order={order}&amp;title={safe_title}"
             entries.append(f'''  <entry>
-    <title>📁 Khoảng: Chương {c_start} -> {c_end} ({len(chunk)} tập)</title>
-    <id>urn:otruyen:range:{safe_slug}:{i}</id>
+    <title>📁 Khoảng: {c_start} -> {c_end} ({len(chunk)} tập)</title>
+    <id>urn:nettruyen:range:{comic_id}:{i}</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Mở danh sách gồm {len(chunk)} chương từ {c_start} đến {c_end}</summary>
     <link rel="subsection" href="{range_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
     else:
         for ch in active_list:
-            entries.append(create_otruyen_chapter_entry(base_url, manga_title, ch))
+            entries.append(create_nettruyen_chapter_entry(base_url, slug, manga_title, ch))
 
-    return format_feed(base_url, f"otruyen:{slug}", manga_title, entries)
+    return format_feed(base_url, f"nettruyen:{comic_id}", manga_title, entries)
 
-# ----------------- MangaDex Feeds -----------------
+# --- MangaDex OPDS Feeds ---
 
 def build_mangadex_list_feed(base_url, feed_title, list_type, manga_list):
     entries = []
@@ -682,11 +820,11 @@ def build_mangadex_list_feed(base_url, feed_title, list_type, manga_list):
         attrs = item.get('attributes', {})
         raw_title = get_mangadex_title(attrs)
         title = xml_escape(raw_title)
-        
+
         desc_dict = attrs.get('description', {})
         desc_text = desc_dict.get('vi') or desc_dict.get('en') or 'Truyện tranh MangaDex tiếng Việt'
         desc_clean = xml_escape(desc_text[:200] + ('...' if len(desc_text) > 200 else ''))
-        
+
         cover_file = get_mangadex_cover(item.get('relationships', []))
         cover_link_xml = ""
         if cover_file:
@@ -720,10 +858,10 @@ def create_mangadex_chapter_entry(base_url, manga_title, ch):
     ch_title = attrs.get('title') or ''
     full_title = f"Chương {ch_num}" + (f": {ch_title}" if ch_title else "")
     esc_title = xml_escape(full_title)
-    
+
     pages_count = attrs.get('pages', 0)
     summary = f"{pages_count} trang ảnh - Tiếng Việt" if pages_count else "Tiếng Việt"
-    
+
     safe_ch_title = urllib.parse.quote(f"{manga_title} - Chap {ch_num}")
     download_url = f"{base_url}/download?chapter_id={ch_id}&amp;title={safe_ch_title}"
 
@@ -738,28 +876,28 @@ def create_mangadex_chapter_entry(base_url, manga_title, ch):
 def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, order='desc', range_param=None, search_q=None):
     entries = []
     safe_manga_title = urllib.parse.quote(manga_title)
-    
-    # Smart Fallback nếu MangaDex bị gỡ chương (DMCA)
+
+    # Smart Fallback nếu MangaDex bị gỡ chương do DMCA hoặc không có chương tiếng Việt
     if not all_chapters:
-        # Thử tìm trên OTruyen tự động
-        otruyen_match = None
+        nt_match = None
         try:
-            ot_items = fetch_otruyen_search(manga_title)
-            if ot_items:
-                otruyen_match = ot_items[0]
+            nt_items = fetch_nettruyen_search(manga_title)
+            if nt_items:
+                nt_match = nt_items[0]
         except Exception:
             pass
 
-        if otruyen_match:
-            ot_slug = otruyen_match.get('slug', '')
-            ot_name = otruyen_match.get('name', manga_title)
-            ot_url = f"{base_url}/opds/otruyen/manga?slug={urllib.parse.quote(ot_slug)}&amp;title={urllib.parse.quote(ot_name)}"
+        if nt_match:
+            nt_slug = nt_match['slug']
+            nt_id = nt_match['id']
+            nt_name = nt_match['title']
+            nt_url = f"{base_url}/opds/nettruyen/manga?slug={urllib.parse.quote(nt_slug)}&amp;id={nt_id}&amp;title={urllib.parse.quote(nt_name)}"
             entries.append(f'''  <entry>
-    <title>✨ [TỰ ĐỘNG CHUYỂN NGUỒN] Đọc Trọn Bộ Trên OTruyen</title>
-    <id>urn:fallback:otruyen:{manga_id}</id>
+    <title>✨ [TỰ ĐỘNG CHUYỂN NGUỒN] Đọc Trọn Bộ Trên NetTruyen</title>
+    <id>urn:fallback:nettruyen:{manga_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Bộ truyện "{xml_escape(manga_title)}" bị khóa bản quyền trên MangaDex nhưng ĐÃ ĐƯỢC TÌM THẤY trên OTruyen. Bấm vào đây để mở trọn bộ đọc ngay!</summary>
-    <link rel="subsection" href="{ot_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <summary>Bộ truyện "{xml_escape(manga_title)}" bị khóa bản quyền trên MangaDex nhưng ĐÃ ĐƯỢC TÌM THẤY trên NetTruyen ({xml_escape(nt_name)}). Bấm vào đây để mở trọn bộ đọc ngay!</summary>
+    <link rel="subsection" href="{nt_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
 
         notice_url = f"{base_url}/download_notice?title={safe_manga_title}"
@@ -767,7 +905,7 @@ def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, o
     <title>⚠️ Đã bị gỡ trên MangaDex do bản quyền DMCA</title>
     <id>urn:mangadex:empty:{manga_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Bấm vào đây để tải thông báo chi tiết và hướng dẫn chuyển sang nguồn OTruyen.</summary>
+    <summary>Bấm vào đây để tải thông báo chi tiết và hướng dẫn chuyển sang nguồn NetTruyen.</summary>
     <link rel="http://opds-spec.org/acquisition" href="{notice_url}" type="application/epub+zip"/>
   </entry>''')
         return format_feed(base_url, f"mangadex:{manga_id}", manga_title, entries)
@@ -776,11 +914,11 @@ def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, o
     sorted_desc = sorted(all_chapters, key=lambda c: parse_num(c.get('attributes', {}).get('chapter', '0')), reverse=True)
     first_ch = sorted_asc[0]
     latest_ch = sorted_desc[0]
-    
+
     first_num = first_ch.get('attributes', {}).get('chapter') or '1'
     latest_num = latest_ch.get('attributes', {}).get('chapter') or 'Mới'
 
-    # 1. Chế độ lọc theo tìm kiếm số chương
+    # 1. Tìm số chương
     if search_q:
         q_lower = search_q.strip().lower()
         matched = []
@@ -789,7 +927,7 @@ def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, o
             c_title = str(ch.get('attributes', {}).get('title') or '').lower()
             if q_lower == c_num or f"chương {q_lower}" in c_title or q_lower in c_title:
                 matched.append(ch)
-        
+
         back_url = f"{base_url}/opds/mangadex/manga?id={manga_id}&amp;title={safe_manga_title}"
         entries.append(f'''  <entry>
     <title>« Quay Lại Danh Mục Chương</title>
@@ -809,19 +947,19 @@ def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, o
         else:
             for ch in matched:
                 entries.append(create_mangadex_chapter_entry(base_url, manga_title, ch))
-        
+
         return format_feed(base_url, f"mangadex:{manga_id}", f"{manga_title} (Tìm số: {search_q})", entries)
 
-    # 2. Chế độ xem theo khoảng chương (Range)
+    # 2. Xem theo khoảng chương (Range)
     if range_param:
         try:
             start_idx, end_idx = map(int, range_param.split('-'))
-        except:
+        except Exception:
             start_idx, end_idx = 0, 40
-        
+
         active_list = sorted_asc if order == 'asc' else sorted_desc
         subset = active_list[start_idx:end_idx]
-        
+
         back_url = f"{base_url}/opds/mangadex/manga?id={manga_id}&amp;title={safe_manga_title}&amp;order={order}"
         entries.append(f'''  <entry>
     <title>« Quay Lại Toàn Bộ Chương</title>
@@ -833,11 +971,11 @@ def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, o
 
         for ch in subset:
             entries.append(create_mangadex_chapter_entry(base_url, manga_title, ch))
-            
+
         r_title = f"{manga_title} (Khoảng {start_idx+1} - {min(end_idx, len(active_list))})"
         return format_feed(base_url, f"mangadex:{manga_id}", r_title, entries)
 
-    # 3. Chế độ mặc định
+    # 3. Chế độ Mặc Định
     first_download = f"{base_url}/download?chapter_id={first_ch['id']}&amp;title={urllib.parse.quote(f'{manga_title} - Chap {first_num}')}"
     entries.append(f'''  <entry>
     <title>⭐ [ĐỌC TỪ ĐẦU] Chương {first_num}</title>
@@ -888,38 +1026,40 @@ def build_mangadex_chapter_feed(base_url, manga_id, manga_title, all_chapters, o
 
     return format_feed(base_url, f"mangadex:{manga_id}", manga_title, entries)
 
-# ----------------- Unified Search Feed -----------------
+# --- Unified Search Feed ---
 
 def build_unified_search_feed(base_url, query):
     entries = []
-    
-    # 1. Search OTruyen (Ưu tiên số 1 vì không bao giờ bị DMCA)
+
+    # 1. Tìm trên NetTruyen (Ưu tiên số 1 vì kho truyện tiếng Việt cực lớn & không DMCA)
     try:
-        ot_items = fetch_otruyen_search(query)
-        for item in ot_items[:20]:
-            name = item.get('name', 'Truyện')
-            slug = item.get('slug', '')
-            thumb = get_otruyen_thumb(item.get('thumb_url', ''))
+        nt_items = fetch_nettruyen_search(query)
+        for item in nt_items[:20]:
+            title = item['title']
+            slug = item['slug']
+            c_id = item['id']
+            thumb = item['thumb']
             safe_slug = urllib.parse.quote(slug)
-            safe_title = urllib.parse.quote(name)
-            
+            safe_title = urllib.parse.quote(title)
+
             cover_xml = ""
             if thumb:
                 cover_xml = f'''<link rel="http://opds-spec.org/image" href="{thumb}" type="image/jpeg"/>
     <link rel="http://opds-spec.org/image/thumbnail" href="{thumb}" type="image/jpeg"/>'''
 
+            manga_url = f"{base_url}/opds/nettruyen/manga?slug={safe_slug}&amp;id={c_id}&amp;title={safe_title}"
             entries.append(f'''  <entry>
-    <title>[OTruyen] {xml_escape(name)}</title>
-    <id>urn:search:otruyen:{safe_slug}</id>
+    <title>[NetTruyen] {xml_escape(title)}</title>
+    <id>urn:search:nettruyen:{c_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Nguồn OTruyen (Đầy đủ, không sợ bản quyền)</summary>
+    <summary>Nguồn NetTruyen (Đầy đủ, không sợ bản quyền)</summary>
     {cover_xml}
-    <link rel="subsection" href="{base_url}/opds/otruyen/manga?slug={safe_slug}&amp;title={safe_title}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+    <link rel="subsection" href="{manga_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
     except Exception as e:
-        print(f"[!] OTruyen search error: {e}")
+        print(f"[!] NetTruyen search error: {e}")
 
-    # 2. Search MangaDex
+    # 2. Tìm trên MangaDex
     try:
         md_items = fetch_mangadex_list("popular", query=query, limit=15)
         for item in md_items:
@@ -927,7 +1067,7 @@ def build_unified_search_feed(base_url, query):
             attrs = item.get('attributes', {})
             raw_title = get_mangadex_title(attrs)
             safe_title = urllib.parse.quote(raw_title)
-            
+
             cover_file = get_mangadex_cover(item.get('relationships', []))
             cover_xml = ""
             if cover_file:
@@ -956,17 +1096,9 @@ def build_unified_search_feed(base_url, query):
 
     return format_feed(base_url, f"search:{urllib.parse.quote(query)}", f"Tìm kiếm: {query}", entries)
 
-def format_feed(base_url, feed_id, feed_title, entries):
-    return f'''<?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>urn:xteink:{feed_id}</id>
-  <title>{xml_escape(feed_title)}</title>
-  <updated>2026-11-10T00:00:00Z</updated>
-  <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-{chr(10).join(entries)}
-</feed>'''
-
-# ----------------- HTTP Handler -----------------
+# ------------------------------------------------------------------------------
+# 5. HTTP Request Handler
+# ------------------------------------------------------------------------------
 
 class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
     def get_base_url(self):
@@ -981,7 +1113,7 @@ class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(parsed.query)
             base_url = self.get_base_url()
 
-            # 1. Root & Search
+            # 1. Trang chủ & Tìm kiếm
             if path in ['/', '/opds']:
                 xml_data = build_root_feed(base_url)
                 self.send_response(200)
@@ -1004,52 +1136,58 @@ class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
-            # 2. OTruyen Routing
-            elif path == '/opds/otruyen/list':
-                list_type = qs.get('type', ['truyen-moi'])[0]
+            # 2. NetTruyen Routing (Kèm tự động chuyển tiếp từ link cũ OTruyen)
+            elif path in ['/opds/nettruyen/list', '/opds/otruyen/list']:
+                list_type = qs.get('type', ['new'])[0]
+                if list_type in ['truyen-moi', 'dang-phat-hanh']:
+                    list_type = 'new'
+                elif list_type in ['hoan-thanh']:
+                    list_type = 'hot'
+
                 page = int(qs.get('page', ['1'])[0])
                 title_map = {
-                    'truyen-moi': 'OTruyen - Mới Cập Nhật',
-                    'dang-phat-hanh': 'OTruyen - Đang Phát Hành',
-                    'hoan-thanh': 'OTruyen - Trọn Bộ Hoàn Thành'
+                    'hot': 'NetTruyen - Truyện Hot Xem Nhiều',
+                    'new': 'NetTruyen - Mới Cập Nhật'
                 }
-                feed_title = title_map.get(list_type, 'OTruyen')
-                items, pagination = fetch_otruyen_list(list_type, page=page)
-                total_pages = pagination.get('totalPages', 1)
-                xml_data = build_otruyen_list_feed(base_url, feed_title, list_type, items, page=page, total_pages=total_pages)
+                feed_title = title_map.get(list_type, 'NetTruyen')
+                items, total_pages = fetch_nettruyen_list(list_type, page=page)
+                xml_data = build_nettruyen_list_feed(base_url, feed_title, list_type, items, page=page, total_pages=total_pages)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
-            elif path == '/opds/otruyen/manga':
+            elif path in ['/opds/nettruyen/manga', '/opds/otruyen/manga']:
                 slug = qs.get('slug', [''])[0]
-                if not slug:
-                    self.send_error(400, "Missing slug")
-                    return
+                comic_id = qs.get('id', [''])[0]
                 manga_title = qs.get('title', [''])[0]
-                item = fetch_otruyen_detail(slug)
-                if not manga_title:
-                    manga_title = item.get('name', 'Truyện')
 
-                chapters = []
-                for srv in item.get('chapters', []):
-                    s_data = srv.get('server_data', [])
-                    if s_data:
-                        chapters = s_data
-                        break
+                # Nếu gọi từ link OTruyen cũ không có comic_id -> tự động tìm trên NetTruyen
+                if not comic_id and (slug or manga_title):
+                    search_kw = manga_title or slug.replace('-', ' ')
+                    found = fetch_nettruyen_search(search_kw)
+                    if found:
+                        slug = found[0]['slug']
+                        comic_id = found[0]['id']
+                        if not manga_title:
+                            manga_title = found[0]['title']
+
+                if not comic_id:
+                    self.send_error(400, "Missing comic id")
+                    return
 
                 order = qs.get('order', ['desc'])[0]
                 range_param = qs.get('range', [''])[0]
                 search_q = qs.get('q', [''])[0].strip()
 
-                xml_data = build_otruyen_chapter_feed(base_url, slug, manga_title, chapters, order=order, range_param=range_param, search_q=search_q)
+                chapters = fetch_nettruyen_chapters(slug, comic_id)
+                xml_data = build_nettruyen_chapter_feed(base_url, slug, comic_id, manga_title, chapters, order=order, range_param=range_param, search_q=search_q)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
-            # 3. MangaDex Routing (kèm tương thích ngược)
+            # 3. MangaDex Routing (Kèm tương thích ngược)
             elif path in ['/opds/mangadex/list', '/opds/list']:
                 list_type = qs.get('type', ['popular'])[0]
                 title_map = {
@@ -1067,18 +1205,20 @@ class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
 
             elif path in ['/opds/mangadex/manga', '/opds/manga']:
                 manga_id = qs.get('id', [''])[0]
-                ot_slug = qs.get('slug', [''])[0]
-                
-                # Nếu truyền slug (tương thích ngược) -> chuyển sang otruyen
-                if ot_slug:
-                    item = fetch_otruyen_detail(ot_slug)
-                    manga_title = qs.get('title', [''])[0] or item.get('name', 'Truyện')
-                    chapters = []
-                    for srv in item.get('chapters', []):
-                        if srv.get('server_data'):
-                            chapters = srv.get('server_data')
-                            break
-                    xml_data = build_otruyen_chapter_feed(base_url, ot_slug, manga_title, chapters)
+                slug = qs.get('slug', [''])[0]
+
+                # Nếu truyền slug -> chuyển sang NetTruyen
+                if slug:
+                    comic_id = qs.get('id', [''])[0]
+                    manga_title = qs.get('title', [''])[0]
+                    if not comic_id:
+                        found = fetch_nettruyen_search(manga_title or slug.replace('-', ' '))
+                        if found:
+                            slug = found[0]['slug']
+                            comic_id = found[0]['id']
+                            manga_title = found[0]['title']
+                    chapters = fetch_nettruyen_chapters(slug, comic_id) if comic_id else []
+                    xml_data = build_nettruyen_chapter_feed(base_url, slug, comic_id, manga_title, chapters)
                 else:
                     if not manga_id:
                         self.send_error(400, "Missing manga id")
@@ -1087,7 +1227,7 @@ class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
                     if not manga_title:
                         try:
                             manga_title = fetch_mangadex_detail(manga_id)
-                        except:
+                        except Exception:
                             manga_title = "Truyện tranh"
 
                     order = qs.get('order', ['desc'])[0]
@@ -1103,13 +1243,17 @@ class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(xml_data.encode('utf-8'))
 
             # 4. Downloads
-            elif path == '/download_otruyen':
-                api_data = qs.get('api_data', [''])[0]
+            elif path in ['/download_nettruyen', '/download_otruyen']:
+                slug = qs.get('slug', [''])[0]
+                chapter_slug = qs.get('chapter_slug', [''])[0]
+                chapter_id = qs.get('chapter_id', [''])[0]
                 title = qs.get('title', ['Manga_Chapter'])[0]
-                if not api_data:
-                    self.send_error(400, "Missing api_data")
+
+                if not chapter_id or not slug:
+                    self.send_error(400, "Missing slug or chapter_id")
                     return
-                final_title, epub_bytes = generate_otruyen_epub(api_data, title)
+
+                final_title, epub_bytes = generate_nettruyen_epub(slug, chapter_slug, chapter_id, title)
                 safe_name = urllib.parse.quote(f"{final_title}.epub")
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/epub+zip')
@@ -1133,7 +1277,7 @@ class MultiSourceMangaHandler(http.server.BaseHTTPRequestHandler):
 
             elif path == '/download_notice':
                 title = qs.get('title', ['Thong bao'])[0]
-                final_title, epub_bytes = generate_notice_epub(title)
+                final_title, epub_bytes = generate_dmca_notice_epub(title)
                 safe_name = urllib.parse.quote(f"{final_title}.epub")
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/epub+zip')
@@ -1164,7 +1308,7 @@ def run():
     port = int(os.environ.get('PORT', 7860))
     server_address = ('0.0.0.0', port)
     httpd = http.server.ThreadingHTTPServer(server_address, MultiSourceMangaHandler)
-    print(f"[*] Xteink Multi-Source Manga Server (OTruyen + MangaDex) running on port {port}...")
+    print(f"[*] Xteink Manga Server v5.0 (NetTruyen + MangaDex) running on port {port}...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
