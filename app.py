@@ -8,12 +8,12 @@ import html
 import sys
 import traceback
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
 
 MANGADEX_API = "https://api.mangadex.org"
 COVER_BASE_URL = "https://uploads.mangadex.org/covers"
 HEADERS = {
-    "User-Agent": "XteinkMangaOPDS/2.0 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
+    "User-Agent": "XteinkMangaOPDS/2.5 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
     "Accept": "application/json"
 }
 
@@ -48,6 +48,16 @@ def build_root_feed(base_url):
   <author><name>Xteink Cloud Bridge</name></author>
   <link rel="self" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
+
+  <entry>
+    <title>🔍 Tìm Kiếm Truyện Nhanh (Gõ Tên / Gợi Ý)</title>
+    <id>urn:xteink:mangadex:search_menu</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Tìm kiếm truyện theo tên hoặc chọn từ danh sách bộ truyện hot gợi ý</summary>
+    <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
+    <link rel="subsection" href="{base_url}/opds/search_shortcuts" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  </entry>
 
   <entry>
     <title>🔥 Truyện Tiếng Việt Xem Nhiều / Hot</title>
@@ -72,6 +82,34 @@ def build_root_feed(base_url):
     <summary>Các bộ truyện vừa có chapter tiếng Việt mới hôm nay</summary>
     <link rel="subsection" href="{base_url}/opds/list?type=latest" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
+</feed>'''
+
+def build_search_shortcuts_feed(base_url):
+    keywords = [
+        "One Piece", "Conan", "Naruto", "Dragon Ball", "Doraemon",
+        "Jujutsu Kaisen", "Chainsaw Man", "Kimetsu no Yaiba",
+        "Attack on Titan", "Bleach", "Hunter x Hunter", "Fairy Tail",
+        "Spy x Family", "Berserk", "Tokyo Ghoul", "Black Clover",
+        "Haikyuu", "Slam Dunk", "Death Note", "Gintama"
+    ]
+    entries = []
+    for kw in keywords:
+        q_enc = urllib.parse.quote(kw)
+        entries.append(f'''  <entry>
+    <title>📖 {kw}</title>
+    <id>urn:xteink:search:{q_enc}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Xem kết quả tìm kiếm cho bộ "{kw}"</summary>
+    <link rel="subsection" href="{base_url}/opds/search?q={q_enc}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  </entry>''')
+    return f'''<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:xteink:search:shortcuts</id>
+  <title>Gợi Ý Tìm Kiếm Nhanh</title>
+  <updated>2026-11-10T00:00:00Z</updated>
+  <link rel="search" href="{base_url}/opds/search?q={{searchTerms}}" type="application/atom+xml"/>
+  <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+{chr(10).join(entries)}
 </feed>'''
 
 def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
@@ -116,11 +154,14 @@ def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
 def build_chapter_feed(base_url, manga_id, manga_title, chapters):
     entries = []
     if not chapters:
+        safe_manga_title = urllib.parse.quote(manga_title)
+        notice_url = f"{base_url}/download_notice?title={safe_manga_title}"
         entries.append(f'''  <entry>
-    <title>Chưa có chương Tiếng Việt trên máy chủ</title>
+    <title>⚠️ Đã bị gỡ do bản quyền DMCA (Bấm để xem thông báo)</title>
     <id>urn:mangadex:empty:{manga_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Bộ truyện này hiện chưa có chương tiếng Việt nào sẵn sàng trên MangaDex. Vui lòng quay lại chọn bộ khác!</summary>
+    <summary>Bộ truyện này hiện không có chương tiếng Việt nào sẵn sàng (đã bị gỡ bỏ theo yêu cầu bản quyền của nhà xuất bản trên MangaDex). Bấm vào đây để tải thông báo chi tiết.</summary>
+    <link rel="http://opds-spec.org/acquisition" href="{notice_url}" type="application/epub+zip"/>
   </entry>''')
 
     for ch in chapters:
@@ -199,6 +240,45 @@ def fetch_chapters(manga_id):
     data = res.json()
     return data.get('data', [])
 
+def optimize_and_split_image(img_bytes):
+    im = Image.open(io.BytesIO(img_bytes))
+    if im.mode != 'L':
+        im = ImageOps.grayscale(im)
+    
+    w, h = im.size
+    sub_images = []
+    
+    if w > h * 1.25:
+        mid = w // 2
+        right_page = im.crop((mid, 0, w, h))
+        left_page = im.crop((0, 0, mid, h))
+        sub_images.extend([right_page, left_page])
+    elif h > w * 1.8:
+        target_h = int(w * 1.6)
+        curr_y = 0
+        while curr_y < h:
+            chunk_h = min(target_h, h - curr_y)
+            if chunk_h < target_h * 0.2 and sub_images:
+                break
+            cropped = im.crop((0, curr_y, w, min(curr_y + chunk_h, h)))
+            sub_images.append(cropped)
+            curr_y += chunk_h
+    else:
+        sub_images.append(im)
+        
+    final_buffers = []
+    for sub in sub_images:
+        sub.thumbnail((480, 800), Image.Resampling.LANCZOS)
+        enhancer = ImageEnhance.Contrast(sub)
+        sub = enhancer.enhance(1.3)
+        sub = sub.filter(ImageFilter.UnsharpMask(radius=1.2, percent=130, threshold=3))
+        
+        buf = io.BytesIO()
+        sub.save(buf, format='JPEG', quality=80, optimize=True)
+        final_buffers.append(buf.getvalue())
+        
+    return final_buffers
+
 def generate_epub(chapter_id, chapter_title):
     res = requests.get(f"{MANGADEX_API}/at-home/server/{chapter_id}", headers=HEADERS, timeout=15)
     res.raise_for_status()
@@ -214,19 +294,14 @@ def generate_epub(chapter_id, chapter_title):
         raise ValueError("Không tìm thấy hình ảnh nào trong chương này trên MangaDex.")
 
     processed_images = []
-    print(f"[*] Đang tải {len(file_list)} trang ảnh cho: {chapter_title}...")
+    print(f"[*] Đang tải và phóng to thông minh {len(file_list)} trang ảnh cho: {chapter_title}...")
     for idx, fname in enumerate(file_list):
         img_url = f"{base_url}/{sub_folder}/{ch_hash}/{fname}"
         try:
             r = requests.get(img_url, headers=HEADERS, timeout=15)
             if r.status_code == 200:
-                im = Image.open(io.BytesIO(r.content))
-                if im.mode != 'L':
-                    im = ImageOps.grayscale(im)
-                im.thumbnail((480, 800), Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                im.save(buf, format='JPEG', quality=75, optimize=True)
-                processed_images.append(buf.getvalue())
+                buffers = optimize_and_split_image(r.content)
+                processed_images.extend(buffers)
         except Exception as e:
             print(f"[!] Lỗi tải trang {idx+1}: {e}")
 
@@ -312,6 +387,57 @@ def generate_epub(chapter_id, chapter_title):
 
     return safe_title, epub_buf.getvalue()
 
+def generate_notice_epub(manga_title):
+    safe_title = f"Thong_bao_{manga_title[:20]}"
+    esc_title = html.escape(manga_title)
+    
+    img = Image.new('L', (480, 800), color=255)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([15, 80, 465, 720], outline=0, width=4)
+    draw.text((40, 130), "THONG BAO BAN QUYEN", fill=0)
+    draw.line([40, 160, 440, 160], fill=0, width=2)
+    draw.text((40, 190), f"Bo truyen:", fill=0)
+    draw.text((40, 220), f"{manga_title[:35]}", fill=0)
+    draw.text((40, 280), "Hien tai toan bo chuong truyen tranh", fill=0)
+    draw.text((40, 315), "cua bo nay da bi go khoi he thong", fill=0)
+    draw.text((40, 350), "theo yeu cau ban quyen (DMCA)", fill=0)
+    draw.text((40, 385), "tu phia nha xuat ban tren MangaDex.", fill=0)
+    draw.text((40, 460), "GIAI PHAP:", fill=0)
+    draw.text((40, 495), "- Bam nut 'Quay lai' tren may Xteink", fill=0)
+    draw.text((40, 530), "- Chon cac bo truyen tranh khac", fill=0)
+    draw.text((40, 565), "  (One Piece, Conan, Naruto,...)", fill=0)
+    draw.text((40, 600), "  de doc day du cac chuong nhe!", fill=0)
+    
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=85)
+    img_bytes = buf.getvalue()
+    
+    epub_buf = io.BytesIO()
+    with zipfile.ZipFile(epub_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", '''<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+    <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>''')
+        zf.writestr("OEBPS/images/page_001.jpg", img_bytes)
+        zf.writestr("OEBPS/page_001.xhtml", '''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Notice</title><style type="text/css">@page { margin: 0; } body { margin: 0; text-align: center; } img { max-width: 100%; height: auto; }</style></head>
+<body><img src="images/page_001.jpg" alt="Notice"/></body></html>''')
+        zf.writestr("OEBPS/content.opf", f'''<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookID" version="2.0">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{esc_title}</dc:title><dc:language>vi</dc:language><dc:identifier id="BookID">urn:notice:dmca</dc:identifier></metadata>
+    <manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="img_001" href="images/page_001.jpg" media-type="image/jpeg"/><item id="page_001" href="page_001.xhtml" media-type="application/xhtml+xml"/></manifest>
+    <spine toc="ncx"><itemref idref="page_001"/></spine>
+</package>''')
+        zf.writestr("OEBPS/toc.ncx", f'''<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+    <head><meta name="dtb:uid" content="urn:notice:dmca"/><meta name="dtb:depth" content="1"/><meta name="dtb:totalPageCount" content="1"/><meta name="dtb:maxPageNumber" content="1"/></head>
+    <docTitle><text>{esc_title}</text></docTitle>
+    <navMap><navPoint id="navPoint-1" playOrder="1"><navLabel><text>{esc_title}</text></navLabel><content src="page_001.xhtml"/></navPoint></navMap>
+</ncx>''')
+    return safe_title, epub_buf.getvalue()
+
 class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
     def get_base_url(self):
         host = self.headers.get('Host', 'xteink-manga.onrender.com')
@@ -327,6 +453,13 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
 
             if path in ['/', '/opds']:
                 xml_data = build_root_feed(base_url)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
+                self.end_headers()
+                self.wfile.write(xml_data.encode('utf-8'))
+
+            elif path == '/opds/search_shortcuts':
+                xml_data = build_search_shortcuts_feed(base_url)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
                 self.end_headers()
@@ -392,6 +525,16 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(epub_bytes)
 
+            elif path == '/download_notice':
+                title = qs.get('title', ['Thong bao'])[0]
+                final_title, epub_bytes = generate_notice_epub(title)
+                safe_name = urllib.parse.quote(f"{final_title}.epub")
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/epub+zip')
+                self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"')
+                self.end_headers()
+                self.wfile.write(epub_bytes)
+
             else:
                 self.send_error(404, "Not Found")
 
@@ -415,7 +558,7 @@ def run():
     port = int(os.environ.get('PORT', 7860))
     server_address = ('0.0.0.0', port)
     httpd = http.server.ThreadingHTTPServer(server_address, MangaOPDSHandler)
-    print(f"[*] Xteink MangaDex Server running on port {port}...")
+    print(f"[*] Xteink MangaDex 2.5 Server running on port {port}...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
