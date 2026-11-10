@@ -7,32 +7,45 @@ import zipfile
 import html
 import sys
 import traceback
-import requests
 from PIL import Image, ImageOps
 
-BASE_TRUYENQQ = 'https://truyenqq.com.vn'
+# Thử dùng curl_cffi để bypass Cloudflare, fallback sang requests
+try:
+    from curl_cffi import requests
+    USE_CURL = True
+    print("[*] Using curl_cffi for Cloudflare bypass")
+except ImportError:
+    import requests
+    USE_CURL = False
+    print("[!] Fallback to standard requests")
 
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'vi,en-US;q=0.9,en;q=0.8',
-    'Referer': 'https://truyenqq.com.vn/'
-})
+BASE_TRUYENQQ = 'https://truyenqqko.com'
+
+def create_session():
+    if USE_CURL:
+        return requests.Session(impersonate="chrome120")
+    s = requests.Session()
+    s.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': 'https://truyenqqko.com/'
+    })
+    return s
+
+session = create_session()
 
 def fetch_html(url):
     if not url.startswith('http'):
         url = urllib.parse.urljoin(BASE_TRUYENQQ, url)
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
+    headers = {'Referer': BASE_TRUYENQQ + '/'}
+    resp = session.get(url, headers=headers, timeout=20)
     resp.encoding = 'utf-8'
     return resp.text
 
 def fetch_bytes(url):
     if not url.startswith('http'):
         url = urllib.parse.urljoin(BASE_TRUYENQQ, url)
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
+    headers = {'Referer': BASE_TRUYENQQ + '/'}
+    resp = session.get(url, headers=headers, timeout=20)
     return resp.content
 
 def xml_escape(text):
@@ -42,15 +55,14 @@ def build_root_feed(base_url):
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
   <id>urn:xteink:manga:root</id>
-  <title>Kho Truyện Tranh TruyenQQ (CrossPoint E-Ink)</title>
+  <title>Kho Truyện Tranh (CrossPoint E-Ink)</title>
   <updated>2026-11-10T00:00:00Z</updated>
   <author><name>CrossPoint Manga Bridge</name></author>
   <link rel="self" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  <link rel="search" href="{base_url}/opds/search?s={{searchTerms}}" type="application/atom+xml" title="Tìm kiếm truyện tranh"/>
 
   <entry>
-    <title>🔥 Truyện Phổ Biến / Hot</title>
+    <title>🔥 TruyenQQ - Truyện Phổ Biến / Hot</title>
     <id>urn:xteink:manga:hot</id>
     <updated>2026-11-10T00:00:00Z</updated>
     <summary>Tuyển tập các bộ truyện tranh hot nhất</summary>
@@ -58,10 +70,10 @@ def build_root_feed(base_url):
   </entry>
 
   <entry>
-    <title>🆕 Truyện Mới Cập Nhật</title>
+    <title>🆕 TruyenQQ - Mới Cập Nhật</title>
     <id>urn:xteink:manga:new</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>Các chương truyện vừa được cập nhật hôm nay</summary>
+    <summary>Các chương truyện vừa ra mắt</summary>
     <link rel="subsection" href="{base_url}/opds/list?path=%2Ftruyen-moi" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>
 </feed>'''
@@ -114,7 +126,6 @@ def build_chapter_feed(base_url, manga_title, manga_path, chapters):
 
 def generate_epub(chapter_url):
     page_html = fetch_html(chapter_url)
-    
     title_match = re.search(r'<title>(.*?)</title>', page_html)
     raw_title = title_match.group(1) if title_match else "Manga Chapter"
     raw_title = html.unescape(raw_title)
@@ -137,20 +148,16 @@ def generate_epub(chapter_url):
     mem_zip = io.BytesIO()
     with zipfile.ZipFile(mem_zip, 'w') as zf:
         zf.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-        
-        container_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+        zf.writestr('META-INF/container.xml', '''<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-    <rootfiles>
-        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-    </rootfiles>
-</container>'''
-        zf.writestr('META-INF/container.xml', container_xml.encode('utf-8'), compress_type=zipfile.ZIP_DEFLATED)
+    <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>'''.encode('utf-8'))
         
         css = '''@page { margin: 0; padding: 0; }
 body { margin: 0; padding: 0; text-align: center; background-color: #ffffff; }
 div.page { width: 100%; height: 100vh; margin: 0; padding: 0; text-align: center; }
 img { max-width: 100%; max-height: 100%; width: auto; height: auto; margin: 0 auto; display: block; }'''
-        zf.writestr('OEBPS/style.css', css.encode('utf-8'), compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr('OEBPS/style.css', css.encode('utf-8'))
 
         manifest_items = [
             '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
@@ -173,20 +180,17 @@ img { max-width: 100%; max-height: 100%; width: auto; height: auto; margin: 0 au
                     out_io = io.BytesIO()
                     img.save(out_io, format='JPEG', quality=85, optimize=True)
                     img_bytes = out_io.getvalue()
-            except Exception as e:
+            except Exception:
                 continue
 
             img_name = f"page_{idx:03d}.jpg"
-            zf.writestr(f"OEBPS/images/{img_name}", img_bytes, compress_type=zipfile.ZIP_DEFLATED)
-
+            zf.writestr(f"OEBPS/images/{img_name}", img_bytes)
+            page_name = f"page_{idx:03d}.xhtml"
             html_content = f'''<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>Trang {idx}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
-<body><div class="page"><img src="images/{img_name}" alt="Page {idx}"/></div></body>
-</html>'''
-            page_name = f"page_{idx:03d}.xhtml"
-            zf.writestr(f"OEBPS/{page_name}", html_content.encode('utf-8'), compress_type=zipfile.ZIP_DEFLATED)
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Trang {idx}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body><div class="page"><img src="images/{img_name}" alt="Page {idx}"/></div></body></html>'''
+            zf.writestr(f"OEBPS/{page_name}", html_content.encode('utf-8'))
             
             manifest_items.append(f'<item id="img_{idx}" href="images/{img_name}" media-type="image/jpeg"/>')
             manifest_items.append(f'<item id="page_{idx}" href="{page_name}" media-type="application/xhtml+xml"/>')
@@ -194,42 +198,18 @@ img { max-width: 100%; max-height: 100%; width: auto; height: auto; margin: 0 au
 
         opf = f'''<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
-    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-        <dc:title>{xml_escape(raw_title)}</dc:title>
-        <dc:language>vi</dc:language>
-        <dc:identifier id="BookId">urn:uuid:truyenqq_{idx}</dc:identifier>
-        <meta name="cover" content="img_1"/>
-    </metadata>
-    <manifest>
-        {"".join(manifest_items)}
-    </manifest>
-    <spine toc="ncx">
-        {"".join(spine_items)}
-    </spine>
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{xml_escape(raw_title)}</dc:title><dc:language>vi</dc:language></metadata>
+    <manifest>{"".join(manifest_items)}</manifest><spine toc="ncx">{"".join(spine_items)}</spine>
 </package>'''
-        zf.writestr('OEBPS/content.opf', opf.encode('utf-8'), compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr('OEBPS/content.opf', opf.encode('utf-8'))
         
-        ncx = f'''<?xml version="1.0" encoding="UTF-8"?>
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
-    <head><meta name="dtb:uid" content="urn:uuid:truyenqq_{idx}"/></head>
-    <docTitle><text>{xml_escape(raw_title)}</text></docTitle>
-    <navMap>
-        <navPoint id="navpoint-1" playOrder="1">
-            <navLabel><text>{xml_escape(raw_title)}</text></navLabel>
-            <content src="page_001.xhtml"/>
-        </navPoint>
-    </navMap>
-</ncx>'''
-        zf.writestr('OEBPS/toc.ncx', ncx.encode('utf-8'), compress_type=zipfile.ZIP_DEFLATED)
+        ncx = f'''<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><docTitle><text>{xml_escape(raw_title)}</text></docTitle><navMap><navPoint id="nav-1"><navLabel><text>{xml_escape(raw_title)}</text></navLabel><content src="page_001.xhtml"/></navPoint></navMap></ncx>'''
+        zf.writestr('OEBPS/toc.ncx', ncx.encode('utf-8'))
 
     mem_zip.seek(0)
     return raw_title, mem_zip.getvalue()
 
 class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        sys.stdout.write(f"[{self.log_date_time_string()}] {format % args}\n")
-        sys.stdout.flush()
-
     def get_base_url(self):
         proto = self.headers.get('X-Forwarded-Proto') or 'https'
         host = self.headers.get('Host') or '127.0.0.1:8000'
@@ -246,7 +226,6 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 xml_data = build_root_feed(base_url)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
-                self.send_header('Content-Length', str(len(xml_data.encode('utf-8'))))
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
@@ -269,32 +248,6 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 xml_data = build_manga_list_feed(base_url, title, items[:35])
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
-                self.send_header('Content-Length', str(len(xml_data.encode('utf-8'))))
-                self.end_headers()
-                self.wfile.write(xml_data.encode('utf-8'))
-
-            elif path == '/opds/search':
-                search_query = qs.get('s', [''])[0]
-                if not search_query:
-                    search_query = 'sat-thu'
-                search_url = f"/tim-kiem?s={urllib.parse.quote(search_query)}"
-                search_html = fetch_html(search_url)
-
-                tags = re.findall(r'<a\s+[^>]*href=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</a>', search_html, re.DOTALL)
-                seen = set()
-                items = []
-                for href, inner in tags:
-                    if href.startswith('/dang-nhap') or 'the-loai' in href or href in ['/', '/contact']:
-                        continue
-                    t = html.unescape(re.sub(r'<[^>]+>', ' ', inner).strip())
-                    if t and len(t) > 3 and href not in seen and not 'chapter' in href:
-                        seen.add(href)
-                        items.append({'title': t, 'path': href})
-
-                xml_data = build_manga_list_feed(base_url, f"Tìm kiếm: {search_query}", items[:35])
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
-                self.send_header('Content-Length', str(len(xml_data.encode('utf-8'))))
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
@@ -324,25 +277,16 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                 xml_data = build_chapter_feed(base_url, manga_title, manga_path, chapters)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
-                self.send_header('Content-Length', str(len(xml_data.encode('utf-8'))))
                 self.end_headers()
                 self.wfile.write(xml_data.encode('utf-8'))
 
             elif path == '/download':
                 ch_url = qs.get('url', [''])[0]
-                if not ch_url:
-                    self.send_error(400, "Missing chapter url")
-                    return
-
-                print(f"[*] Request download chapter: {ch_url}")
                 title, epub_bytes = generate_epub(ch_url)
-                print(f"[+] Built EPUB for '{title}', size: {len(epub_bytes)} bytes")
-
                 safe_name = urllib.parse.quote(f"{title}.epub")
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/epub+zip')
-                self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{safe_name}')
-                self.send_header('Content-Length', str(len(epub_bytes)))
+                self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"')
                 self.end_headers()
                 self.wfile.write(epub_bytes)
 
@@ -351,26 +295,24 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
 
         except Exception as e:
             err_msg = traceback.format_exc()
-            print(f"[!] Server Error on {self.path}: {err_msg}")
             xml_err = f'''<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
-  <title>Lỗi kết nối TruyenQQ</title>
+  <title>Lỗi kết nối</title>
   <entry>
-    <title>Không thể lấy dữ liệu: {xml_escape(str(e))}</title>
+    <title>Lỗi: {xml_escape(str(e))}</title>
     <summary>{xml_escape(err_msg)}</summary>
   </entry>
 </feed>'''
             self.send_response(200)
             self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
-            self.send_header('Content-Length', str(len(xml_err.encode('utf-8'))))
             self.end_headers()
             self.wfile.write(xml_err.encode('utf-8'))
 
 def run():
-    port = int(os.environ.get('PORT', sys.argv[1] if len(sys.argv) > 1 else 7860))
+    port = int(os.environ.get('PORT', 7860))
     server_address = ('0.0.0.0', port)
     httpd = http.server.ThreadingHTTPServer(server_address, MangaOPDSHandler)
-    print(f"[*] CrossPoint Manga OPDS Server running on port {port}...")
+    print(f"[*] CrossPoint Manga Server on {port}...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
