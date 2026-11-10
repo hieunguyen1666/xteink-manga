@@ -6,6 +6,7 @@ import io
 import zipfile
 import html
 import sys
+import time
 import traceback
 import requests
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
@@ -13,9 +14,12 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
 MANGADEX_API = "https://api.mangadex.org"
 COVER_BASE_URL = "https://uploads.mangadex.org/covers"
 HEADERS = {
-    "User-Agent": "XteinkMangaOPDS/3.0 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
+    "User-Agent": "XteinkMangaOPDS/3.5 (Xteink X4 E-Reader Bridge; https://github.com/hieunguyen1666/xteink-manga)",
     "Accept": "application/json"
 }
+
+# In-memory cache for fast chapter navigation (TTL: 15 minutes)
+CHAPTER_CACHE = {}
 
 def xml_escape(text):
     return html.escape(text or '')
@@ -38,6 +42,13 @@ def get_cover_filename(relationships):
         if rel.get('type') == 'cover_art':
             return rel.get('attributes', {}).get('fileName')
     return None
+
+def parse_ch_num(ch):
+    try:
+        val = ch.get('attributes', {}).get('chapter', '0')
+        return float(val) if val else -1.0
+    except:
+        return -1.0
 
 def build_root_feed(base_url):
     return f'''<?xml version="1.0" encoding="utf-8"?>
@@ -151,10 +162,45 @@ def build_manga_list_feed(base_url, feed_title, feed_id, manga_list):
 {chr(10).join(entries)}
 </feed>'''
 
-def build_chapter_feed(base_url, manga_id, manga_title, chapters):
+def create_chapter_entry(base_url, manga_title, ch):
+    ch_id = ch['id']
+    attrs = ch.get('attributes', {})
+    ch_num = attrs.get('chapter') or 'OneShot'
+    ch_title = attrs.get('title') or ''
+    full_title = f"Chương {ch_num}" + (f": {ch_title}" if ch_title else "")
+    esc_title = xml_escape(full_title)
+    
+    pages_count = attrs.get('pages', 0)
+    summary = f"{pages_count} trang ảnh - Tiếng Việt" if pages_count else "Tiếng Việt"
+    
+    safe_ch_title = urllib.parse.quote(f"{manga_title} - Chap {ch_num}")
+    download_url = f"{base_url}/download?chapter_id={ch_id}&amp;title={safe_ch_title}"
+
+    return f'''  <entry>
+    <title>{esc_title}</title>
+    <id>urn:mangadex:chapter:{ch_id}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>{summary}</summary>
+    <link rel="http://opds-spec.org/acquisition" href="{download_url}" type="application/epub+zip"/>
+  </entry>'''
+
+def format_chapter_feed(base_url, manga_id, manga_title, entries):
+    safe_title = urllib.parse.quote(manga_title)
+    return f'''<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:mangadex:manga:{manga_id}</id>
+  <title>{xml_escape(manga_title)}</title>
+  <updated>2026-11-10T00:00:00Z</updated>
+  <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="{base_url}/opds/manga?id={manga_id}&amp;title={safe_title}&amp;q={{searchTerms}}" type="application/atom+xml"/>
+{chr(10).join(entries)}
+</feed>'''
+
+def build_chapter_feed(base_url, manga_id, manga_title, all_chapters, order='desc', range_param=None, search_q=None):
     entries = []
-    if not chapters:
-        safe_manga_title = urllib.parse.quote(manga_title)
+    safe_manga_title = urllib.parse.quote(manga_title)
+    
+    if not all_chapters:
         notice_url = f"{base_url}/download_notice?title={safe_manga_title}"
         entries.append(f'''  <entry>
     <title>⚠️ Đã bị gỡ do bản quyền DMCA (Bấm để xem thông báo)</title>
@@ -163,37 +209,128 @@ def build_chapter_feed(base_url, manga_id, manga_title, chapters):
     <summary>Bộ truyện này hiện không có chương tiếng Việt nào sẵn sàng (đã bị gỡ bỏ theo yêu cầu bản quyền của nhà xuất bản trên MangaDex). Bấm vào đây để tải thông báo chi tiết.</summary>
     <link rel="http://opds-spec.org/acquisition" href="{notice_url}" type="application/epub+zip"/>
   </entry>''')
+        return format_chapter_feed(base_url, manga_id, manga_title, entries)
 
-    for ch in chapters:
-        ch_id = ch['id']
-        attrs = ch.get('attributes', {})
-        ch_num = attrs.get('chapter') or 'OneShot'
-        ch_title = attrs.get('title') or ''
-        full_title = f"Chương {ch_num}" + (f": {ch_title}" if ch_title else "")
-        esc_title = xml_escape(full_title)
-        
-        pages_count = attrs.get('pages', 0)
-        summary = f"{pages_count} trang ảnh - Tiếng Việt" if pages_count else "Tiếng Việt"
-        
-        safe_ch_title = urllib.parse.quote(f"{manga_title} - Chap {ch_num}")
-        download_url = f"{base_url}/download?chapter_id={ch_id}&amp;title={safe_ch_title}"
+    # Sort numerically
+    sorted_asc = sorted(all_chapters, key=parse_ch_num)
+    sorted_desc = sorted(all_chapters, key=parse_ch_num, reverse=True)
+    first_ch = sorted_asc[0]
+    latest_ch = sorted_desc[0]
+    
+    first_num = first_ch.get('attributes', {}).get('chapter') or '1'
+    latest_num = latest_ch.get('attributes', {}).get('chapter') or 'Mới'
 
+    # 1. Chế độ lọc theo tìm kiếm số chương (Search Query q, ví dụ: q=50)
+    if search_q:
+        q_lower = search_q.strip().lower()
+        matched = []
+        for ch in sorted_desc:
+            c_num = str(ch.get('attributes', {}).get('chapter') or '').lower()
+            c_title = str(ch.get('attributes', {}).get('title') or '').lower()
+            if q_lower == c_num or f"chương {q_lower}" in c_title or q_lower in c_title or f"chap {q_lower}" in c_title:
+                matched.append(ch)
+        
+        back_url = f"{base_url}/opds/manga?id={manga_id}&amp;title={safe_manga_title}"
         entries.append(f'''  <entry>
-    <title>{esc_title}</title>
-    <id>urn:mangadex:chapter:{ch_id}</id>
+    <title>« Quay Lại Danh Mục Chương</title>
+    <id>urn:mangadex:back:{manga_id}</id>
     <updated>2026-11-10T00:00:00Z</updated>
-    <summary>{summary}</summary>
-    <link rel="http://opds-spec.org/acquisition" href="{download_url}" type="application/epub+zip"/>
+    <summary>Xem toàn bộ danh mục chương của bộ truyện</summary>
+    <link rel="subsection" href="{back_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>''')
 
-    return f'''<?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>urn:mangadex:manga:{manga_id}</id>
-  <title>{xml_escape(manga_title)}</title>
-  <updated>2026-11-10T00:00:00Z</updated>
-  <link rel="start" href="{base_url}/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-{chr(10).join(entries)}
-</feed>'''
+        if not matched:
+            entries.append(f'''  <entry>
+    <title>Không tìm thấy chương nào khớp với "{xml_escape(search_q)}"</title>
+    <id>urn:mangadex:notfound:{manga_id}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Vui lòng thử gõ số chương khác hoặc bấm 'Quay Lại'</summary>
+  </entry>''')
+        else:
+            for ch in matched:
+                entries.append(create_chapter_entry(base_url, manga_title, ch))
+        
+        return format_chapter_feed(base_url, manga_id, f"{manga_title} (Tìm số: {search_q})", entries)
+
+    # 2. Chế độ xem theo Phân đoạn chương (Range, ví dụ: range=0-40)
+    if range_param:
+        try:
+            start_idx, end_idx = map(int, range_param.split('-'))
+        except:
+            start_idx, end_idx = 0, 40
+        
+        active_list = sorted_asc if order == 'asc' else sorted_desc
+        subset = active_list[start_idx:end_idx]
+        
+        back_url = f"{base_url}/opds/manga?id={manga_id}&amp;title={safe_manga_title}&amp;order={order}"
+        entries.append(f'''  <entry>
+    <title>« Quay Lại Toàn Bộ Chương</title>
+    <id>urn:mangadex:back:{manga_id}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Trở về danh mục phân đoạn chương</summary>
+    <link rel="subsection" href="{back_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  </entry>''')
+
+        for ch in subset:
+            entries.append(create_chapter_entry(base_url, manga_title, ch))
+            
+        r_title = f"{manga_title} (Khoảng {start_idx+1} - {min(end_idx, len(active_list))})"
+        return format_chapter_feed(base_url, manga_id, r_title, entries)
+
+    # 3. Chế độ Tổng quan chương chính (Trang danh mục đầu tiên)
+    # A. Phím tắt Đọc Từ Đầu (Chương 1)
+    first_download = f"{base_url}/download?chapter_id={first_ch['id']}&amp;title={urllib.parse.quote(f'{manga_title} - Chap {first_num}')}"
+    entries.append(f'''  <entry>
+    <title>⭐ [ĐỌC TỪ ĐẦU] Chương {first_num}</title>
+    <id>urn:mangadex:readfirst:{manga_id}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Tải và đọc ngay từ chương đầu tiên của bộ truyện</summary>
+    <link rel="http://opds-spec.org/acquisition" href="{first_download}" type="application/epub+zip"/>
+  </entry>''')
+
+    # B. Phím tắt Đọc Mới Nhất
+    latest_download = f"{base_url}/download?chapter_id={latest_ch['id']}&amp;title={urllib.parse.quote(f'{manga_title} - Chap {latest_num}')}"
+    entries.append(f'''  <entry>
+    <title>🔥 [ĐỌC MỚI NHẤT] Chương {latest_num}</title>
+    <id>urn:mangadex:readlatest:{manga_id}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Tải và đọc ngay chương mới nhất vừa cập nhật</summary>
+    <link rel="http://opds-spec.org/acquisition" href="{latest_download}" type="application/epub+zip"/>
+  </entry>''')
+
+    # C. Đổi thứ tự sắp xếp (Cũ nhất trước <-> Mới nhất trước)
+    next_order = 'asc' if order == 'desc' else 'desc'
+    order_label = "Từ Chương 1 -> Mới nhất" if order == 'desc' else "Mới nhất -> Cũ nhất"
+    order_toggle_url = f"{base_url}/opds/manga?id={manga_id}&amp;order={next_order}&amp;title={safe_manga_title}"
+    entries.append(f'''  <entry>
+    <title>🔄 Đổi Thứ Tự: Xem [{order_label}]</title>
+    <id>urn:mangadex:order:{manga_id}:{next_order}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Bấm vào đây để đảo chiều danh sách chương</summary>
+    <link rel="subsection" href="{order_toggle_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  </entry>''')
+
+    # D. Phân đoạn nhóm chương (Nếu truyện dài hơn 35 chương)
+    active_list = sorted_asc if order == 'asc' else sorted_desc
+    chunk_size = 40
+    if len(active_list) > 35:
+        for i in range(0, len(active_list), chunk_size):
+            chunk = active_list[i:i+chunk_size]
+            c_start = chunk[0].get('attributes', {}).get('chapter') or str(i+1)
+            c_end = chunk[-1].get('attributes', {}).get('chapter') or str(i+len(chunk))
+            range_url = f"{base_url}/opds/manga?id={manga_id}&amp;range={i}-{i+chunk_size}&amp;order={order}&amp;title={safe_manga_title}"
+            entries.append(f'''  <entry>
+    <title>📁 Khoảng: Chương {c_start} -> {c_end} ({len(chunk)} tập)</title>
+    <id>urn:mangadex:range:{manga_id}:{i}</id>
+    <updated>2026-11-10T00:00:00Z</updated>
+    <summary>Mở danh sách gồm {len(chunk)} chương từ {c_start} đến {c_end}</summary>
+    <link rel="subsection" href="{range_url}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  </entry>''')
+    else:
+        for ch in active_list:
+            entries.append(create_chapter_entry(base_url, manga_title, ch))
+
+    return format_chapter_feed(base_url, manga_id, manga_title, entries)
 
 def fetch_mangadex_list(list_type, query=None, limit=30, offset=0):
     params = {
@@ -228,8 +365,14 @@ def fetch_manga_detail(manga_id):
     return get_manga_title(attrs)
 
 def fetch_chapters(manga_id):
+    now = time.time()
+    if manga_id in CHAPTER_CACHE:
+        ts, cached = CHAPTER_CACHE[manga_id]
+        if now - ts < 900:  # 15 minutes TTL
+            return cached
+
     params = {
-        "limit": 100,
+        "limit": 500,
         "translatedLanguage[]": ["vi"],
         "order[chapter]": "desc",
         "includeExternalUrl": 0,
@@ -238,7 +381,9 @@ def fetch_chapters(manga_id):
     res = requests.get(f"{MANGADEX_API}/manga/{manga_id}/feed", headers=HEADERS, params=params, timeout=15)
     res.raise_for_status()
     data = res.json()
-    return data.get('data', [])
+    chapters = data.get('data', [])
+    CHAPTER_CACHE[manga_id] = (now, chapters)
+    return chapters
 
 def crop_margins(im, threshold=242, margin_pad=4):
     if im.mode != 'L':
@@ -521,8 +666,12 @@ class MangaOPDSHandler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         manga_title = "Truyện tranh"
 
+                order = qs.get('order', ['desc'])[0]
+                range_param = qs.get('range', [''])[0]
+                search_q = qs.get('q', [''])[0].strip()
+
                 chapters = fetch_chapters(manga_id)
-                xml_data = build_chapter_feed(base_url, manga_id, manga_title, chapters)
+                xml_data = build_chapter_feed(base_url, manga_id, manga_title, chapters, order=order, range_param=range_param, search_q=search_q)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/atom+xml;charset=utf-8')
                 self.end_headers()
@@ -576,7 +725,7 @@ def run():
     port = int(os.environ.get('PORT', 7860))
     server_address = ('0.0.0.0', port)
     httpd = http.server.ThreadingHTTPServer(server_address, MangaOPDSHandler)
-    print(f"[*] Xteink MangaDex 3.0 Ultra-Crisp running on port {port}...")
+    print(f"[*] Xteink MangaDex 3.5 Quick Chapter Navigator running on port {port}...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
